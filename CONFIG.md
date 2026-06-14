@@ -12,6 +12,8 @@ A copy of default_config.cfg can be found under the /templates folder.  It is re
         "log_path": "/logs",    
         "cache_path": "/config",    
         "session": "",
+        "mousehole_enabled": 0,
+        "mousehole_state_file": "/app/secrets/state.json",
         "paths": [{
             "files": ["**/*.m4b", "**/*.mp3", "**/*.m4a"],
             "source_path": "/path/to/downloads",
@@ -53,6 +55,8 @@ A copy of default_config.cfg can be found under the /templates folder.  It is re
 | log_path    |         | Where your log files will be saved. If not set, will default to "logs" | /logs (for docker), logs (for local)   |
 | cache_path  |         | Where your log files will be saved. If not set, will default to "logs" | /config   |
 | session     |         | MAM Session ID (can be removed once one has been saved) |    |
+| mousehole_enabled |  | If true, read the MAM session cookie from a mousehole state file instead of relying on a static session ID | 0 |
+| mousehole_state_file | | Path to mousehole's state.json file. The file should include `currentCookie` | /app/secrets/state.json |
 | paths       |         | This is a *list* of folders and files to be processed              |
 | | files               | File patterns to be searched | ["\*\*/\*.m4b", "\*\*/\*.mp3", "\*\*/\*.m4a"]    |
 | | source_path         | Unorganized folder location | /path/to/downloads   |
@@ -78,3 +82,22 @@ A copy of default_config.cfg can be found under the /templates folder.  It is re
 | | kw_ignore           | Characters ignored when generating keywords for search | | [".", ":", "_", "[", "]", "{", "}", ",", ";", "(", ")"]    |
 | | kw_ignore_words     | Characters ignored when optimizing keywords for search| ["the","and","m4b","mp3","series","audiobook","audiobooks", "book", "part", "track", "novel", "disc"]    |
 | | title_patterns      | ignores these patterns when alt Title is generated from bad id3 data | ["-end", "\bpart\b", "\btrack\b", "\bof\b",  "\bbook\b", "m4b", "\\(", "\\)", "_", "\\[", "\\]", "\\.", "\\s?-\\s?"]    |
+
+## Mousehole
+
+booktree can read the current MAM session cookie from [mousehole](https://github.com/t-mart/mousehole), which avoids manually updating `Config/session` when your IP changes. Enable it in your config file:
+
+~~~
+"mousehole_enabled": 1,
+"mousehole_state_file": "/app/secrets/state.json"
+~~~
+
+mousehole writes a JSON state file with a URL-encoded `currentCookie` value:
+
+~~~
+{
+    "currentCookie": "your%2Bmam%2Fsession%2Fcookie"
+}
+~~~
+
+When `mousehole_enabled` is true, booktree reads and URL-decodes `currentCookie` for MAM API calls. If the state file is missing or invalid, booktree falls back to `Config/session`.

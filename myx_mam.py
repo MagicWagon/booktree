@@ -2,17 +2,44 @@ import requests
 import json
 import os
 import pickle
+from urllib.parse import unquote
 from pprint import pprint
 import myx_classes
 import myx_utilities
 
 
 #MAM Functions
+def isMouseholeEnabled(cfg):
+    mousehole_enabled = cfg.get("Config/mousehole_enabled", 0)
+    if isinstance(mousehole_enabled, str):
+        return mousehole_enabled.lower() in ("1", "true", "yes", "on")
+    return bool(mousehole_enabled)
+
+def getMAMSession(cfg):
+    session = cfg.get("Config/session")
+
+    if isMouseholeEnabled(cfg):
+        mousehole_state_file = cfg.get("Config/mousehole_state_file")
+        try:
+            if mousehole_state_file is None or not len(mousehole_state_file):
+                raise Exception("mousehole_state_file is not configured")
+            with open(mousehole_state_file) as state_file:
+                state = json.loads(state_file.read())
+            mousehole_session = unquote(state["currentCookie"]).strip()
+            if len(mousehole_session):
+                return mousehole_session
+            print("Mousehole state file did not contain a session cookie. Checking session ID from config...")
+        except Exception as e:
+            print(f"Failed to read mousehole state file: {e}. Checking session ID from config...")
+
+    return session
+
 def searchMAM(cfg, titleFilename, authors, extension):
     #Config
-    session = cfg.get("Config/session")
+    session = getMAMSession(cfg)
     log_path = cfg.get("Config/log_path")
     verbose = bool(cfg.get("Config/flags/verbose"))
+    mousehole_enabled = isMouseholeEnabled(cfg)
 
     ebook = bool(cfg.get("Config/flags/ebooks"))
     audiobook = not (ebook)
@@ -39,8 +66,10 @@ def searchMAM(cfg, titleFilename, authors, extension):
         cookies_filepath = os.path.join(log_path, 'cookies.pkl')
         sess = requests.Session()
 
+        if mousehole_enabled:
+            sess.headers.update({"cookie": f"mam_id={session}"})
         #a cookie file exists, use that
-        if os.path.exists(cookies_filepath):
+        elif os.path.exists(cookies_filepath):
             cookies = pickle.load(open(cookies_filepath, 'rb'))
             sess.cookies = cookies
         else:
@@ -176,16 +205,19 @@ def testSessionCookie(mySession):
 
 def checkMAMCookie(cfg):
     #Config
-    session = cfg.get("Config/session")
+    session = getMAMSession(cfg)
     log_path = cfg.get("Config/log_path")
+    mousehole_enabled = isMouseholeEnabled(cfg)
 
     isCookieValid = False
-    useConfigSession = False
+    useConfigSession = mousehole_enabled
     cookies_filepath = os.path.join(log_path, 'cookies.pkl')
     sess = requests.Session()
 
     #Check if a cookie file exists
-    if os.path.exists(cookies_filepath):
+    if mousehole_enabled:
+        print (f"Checking MAM cookie from mousehole state file...")
+    elif os.path.exists(cookies_filepath):
         print (f"Checking if current cookie file is still valid...")
         #If it does, create a session, using this cookie
         cookies = pickle.load(open(cookies_filepath, 'rb'))
@@ -210,7 +242,7 @@ def checkMAMCookie(cfg):
             isCookieValid = testSessionCookie (sess)
 
         else:
-            print (f"No session ID found in the config... Please go to MAM Preferences > Security to create a new session")
+            print (f"No session ID found in the config or mousehole state file... Please go to MAM Preferences > Security to create a new session")
         
 
     return isCookieValid
@@ -233,4 +265,3 @@ def escape_string(input_string):
             escaped_string += char  
 
     return escaped_string  
-

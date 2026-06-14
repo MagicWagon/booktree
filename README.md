@@ -46,6 +46,43 @@ options:
 2. copy default_config.cfg into config.json and modify with your paths settings (files, source_path, media_path)
 3. if using MAM as a source, create a MAM session ID and set the value in config.json file (/Config/session)
 
+### Mousehole Integration
+
+booktree can use [mousehole](https://github.com/t-mart/mousehole) to read the current MAM session cookie from mousehole's `state.json` file. This avoids manually updating `/Config/session` when your IP address changes and mousehole rotates the cookie.
+
+Enable mousehole in your config:
+
+~~~
+"mousehole_enabled": 1,
+"mousehole_state_file": "/app/secrets/state.json"
+~~~
+
+The mousehole state file should contain a URL-encoded `currentCookie` value:
+
+~~~
+{
+    "currentCookie": "your%2Bmam%2Fsession%2Fcookie"
+}
+~~~
+
+When mousehole is enabled, booktree uses `currentCookie` directly and ignores any cached `cookies.pkl` so token rotation is picked up immediately. If the state file is missing or invalid, booktree falls back to `/Config/session`.
+
+For Docker, mount the same mousehole data directory into the booktree container and point `mousehole_state_file` at the mounted state file:
+
+~~~
+services:
+  mousehole:
+    image: tmmrtn/mousehole:latest
+    volumes:
+      - /path/to/mousehole:/srv/mousehole
+
+  booktree:
+    volumes:
+      - /path/to/mousehole:/app/secrets
+      - /path/to/booktree/config:/config
+      - /path/to/logs:/logs
+~~~
+
 ### Recommended Workflow
 
 1. Start small (pick a folder that has a handful of books, don't run it on 2K files the first try :) )
@@ -91,5 +128,4 @@ options:
   **Q:  My metadata is not producing any match, what can I do?**
   <p>A: Lower the matchrate, Change the fuzzy_match algorith, Set --fixid3 flag.</p>
   
-
 
