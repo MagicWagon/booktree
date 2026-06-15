@@ -2,7 +2,7 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "codex/webui" ]
     tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
@@ -38,6 +38,7 @@ jobs:
           images: ghcr.io/magicwagon/booktree
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
