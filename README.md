@@ -48,13 +48,15 @@ options:
 
 ## Web UI
 
-The Docker image now starts a Next.js web UI on port `3000`. The UI is for exception handling: import the latest Booktree CSV log, review books that need metadata or matching, edit fields, run targeted MAM/Audible searches, accept a candidate, and reprocess one book at a time.
+The Docker image now starts a Next.js web UI on port `3000`. The UI is for exception handling: review books that need metadata or matching, edit fields, run targeted MAM/Audible searches, accept a candidate, and reprocess one book at a time.
 
 Operational state is stored in SQLite at:
 
 ~~~
 /config/booktree.db
 ~~~
+
+Normal CLI runs write their processed book state directly to this database after the CSV log is written. Existing CSV logs can still be synced from the UI for backfill or recovery.
 
 The existing CLI still works inside the container:
 

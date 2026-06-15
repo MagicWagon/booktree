@@ -9,6 +9,7 @@ import myx_audible
 import myx_utilities
 import myx_mam
 import myx_args
+import booktree_worker
 import csv
 import httpx
 
@@ -128,6 +129,7 @@ def buildTreeFromLog(files, logfile, cfg):
         #Logging processed files
         print (f"\nLogging {len(allFiles)} processed books")
         myx_utilities.logBooks(logfile, allFiles, cfg)      
+        booktree_worker.sync_books_safely(allFiles, cfg, source="cli-log-mode")
 
         print(f"\nCompleted processing {len(allFiles)} books. {len(matchedFiles)}/{len(unmatchedFiles)} match/unmatch ratio.", end=" ")                 
         print("\n\n")    
@@ -331,6 +333,7 @@ def buildTreeFromHybridSources(path, mediaPath, files, logfile, cfg):
     #Logging processed files
     print (f"\nLogging {len(normalBooks)} processed books")
     myx_utilities.logBooks(logfile, normalBooks, cfg)  
+    booktree_worker.sync_books_safely(normalBooks, cfg, source="cli")
 
     print(f"Completed processing {len(normalBooks)} books. {len(matchedFiles)}/{len(normalBooks) - len(matchedFiles)} match/unmatch ratio.")
     myx_utilities.printDivider()
@@ -411,5 +414,4 @@ if __name__ == "__main__":
 
 
  
-
 

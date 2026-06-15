@@ -99,6 +99,23 @@ export default function Home() {
     loadDetail().catch((err) => setError(err.message));
   }, [selectedId]);
 
+  useEffect(() => {
+    if (busy) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      refresh()
+        .then(() => {
+          if (selectedId) {
+            return loadDetail(selectedId);
+          }
+          return undefined;
+        })
+        .catch((err) => setError(err.message));
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [busy, status, query, selectedId]);
+
   function updateField(field, value) {
     setDetail((current) => ({
       ...current,
@@ -141,12 +158,12 @@ export default function Home() {
             onClick={() =>
               run("import", async () => ({
                 ...(await requestJson("/api/import", { method: "POST", body: "{}" })),
-                message: "Imported latest Booktree log",
+                message: "Synced Booktree logs",
               }))
             }
             disabled={!!busy}
           >
-            Import Latest Log
+            Sync Logs
           </button>
           <button
             onClick={() =>
@@ -234,7 +251,7 @@ export default function Home() {
                 ))}
               </tbody>
             </table>
-            {!books.length ? <div className="empty-state">No books found. Import a Booktree log to populate the queue.</div> : null}
+            {!books.length ? <div className="empty-state">No books found yet. Run Booktree or sync existing logs to populate the queue.</div> : null}
           </div>
         </section>
 

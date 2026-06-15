@@ -145,6 +145,14 @@ def init_db(conn):
             payload_json TEXT,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS log_imports (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            imported_rows INTEGER NOT NULL DEFAULT 0,
+            imported_at TEXT NOT NULL
+        );
         """
     )
     conn.commit()
@@ -202,8 +210,17 @@ def status_from_log(row, existing_status=None):
     return "no_match"
 
 
-def book_payload_from_log(row, existing_status=None):
+def status_from_counts(row, existing_status=None):
     status = status_from_log(row, existing_status)
+    if status in {"matched", "processed", "needs_metadata"}:
+        return status
+    if to_int(row.get("mamCount")) + to_int(row.get("audibleMatchCount")) > 1:
+        return "multiple_matches"
+    return status
+
+
+def book_payload_from_log(row, existing_status=None):
+    status = status_from_counts(row, existing_status)
     return {
         "identity_hash": identity_for(row),
         "name": first(row.get("book"), row.get("file"), "Unknown book"),
@@ -253,6 +270,38 @@ def upsert_book(conn, payload):
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def book_to_log_rows(book, cfg):
+    rows = []
+    for book_file in getattr(book, "files", []):
+        row = book.getLogRecord(book_file, cfg)
+        rows.append({key: clean(value) for key, value in row.items()})
+    return rows
+
+
+def sync_books(books, cfg, db_file=None, source="cli"):
+    db_file = db_file or os.environ.get("BOOKTREE_DB") or DEFAULT_DB
+    synced = 0
+    with connect(db_file) as conn:
+        init_db(conn)
+        for book in books:
+            for row in book_to_log_rows(book, cfg):
+                payload = book_payload_from_log(row)
+                book_id = upsert_book(conn, payload)
+                add_event(conn, book_id, "synced", f"Synced from {source}", {"source": source})
+                synced += 1
+        conn.commit()
+    return synced
+
+
+def sync_books_safely(books, cfg, db_file=None, source="cli"):
+    try:
+        synced = sync_books(books, cfg, db_file, source)
+        if synced:
+            print(f"Updated Booktree web UI state for {synced} book file(s).")
+    except Exception as exc:
+        print(f"Warning: failed to update Booktree web UI state: {exc}")
+
+
 def config_data(path):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
@@ -270,26 +319,84 @@ def latest_log(path):
     return candidates[-1] if candidates else None
 
 
-def import_logs(args):
-    cfg_path = config_path(args)
-    log_file = args.log_file or latest_log(args.log_dir or log_dir_from_config(cfg_path))
+def log_signature(log_file):
+    stat = os.stat(log_file)
+    return os.path.abspath(log_file), stat.st_size, stat.st_mtime
+
+
+def was_log_imported(conn, log_file):
+    path, size, mtime = log_signature(log_file)
+    existing = conn.execute(
+        "SELECT path FROM log_imports WHERE path = ? AND size = ? AND mtime = ?",
+        (path, size, mtime),
+    ).fetchone()
+    return existing is not None
+
+
+def mark_log_imported(conn, log_file, imported):
+    path, size, mtime = log_signature(log_file)
+    conn.execute(
+        """
+        INSERT INTO log_imports (path, size, mtime, imported_rows, imported_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+          size = excluded.size,
+          mtime = excluded.mtime,
+          imported_rows = excluded.imported_rows,
+          imported_at = excluded.imported_at
+        """,
+        (path, size, mtime, imported, now()),
+    )
+
+
+def import_log_file(conn, log_file, force=False):
     if not log_file or not os.path.exists(log_file):
-        raise ValueError("No Booktree log file found to import")
+        return 0
+    if not force and was_log_imported(conn, log_file):
+        return 0
+    imported = 0
+    with open(log_file, newline="", errors="ignore", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            if not clean(row.get("book")) and not clean(row.get("file")):
+                continue
+            payload = book_payload_from_log(row)
+            book_id = upsert_book(conn, payload)
+            add_event(conn, book_id, "imported", f"Imported from {log_file}", {"log_file": log_file})
+            imported += 1
+    mark_log_imported(conn, log_file, imported)
+    return imported
+
+
+def log_files_to_import(args):
+    if getattr(args, "log_file", None):
+        return [args.log_file]
+    cfg_path = config_path(args)
+    log_dir = getattr(args, "log_dir", None) or log_dir_from_config(cfg_path)
+    return sorted(glob(os.path.join(log_dir, "booktree_log_*.csv")))
+
+
+def import_logs(args, force=False, missing_ok=False):
+    log_files = log_files_to_import(args)
+    if not log_files and not missing_ok:
+        raise ValueError("No Booktree log files found to import")
 
     imported = 0
+    scanned = 0
     with connect(db_path(args)) as conn:
         init_db(conn)
-        with open(log_file, newline="", errors="ignore", encoding="utf-8") as csv_file:
-            reader = csv.DictReader(csv_file)
-            for row in reader:
-                if not clean(row.get("book")) and not clean(row.get("file")):
-                    continue
-                payload = book_payload_from_log(row)
-                book_id = upsert_book(conn, payload)
-                add_event(conn, book_id, "imported", f"Imported from {log_file}", {"log_file": log_file})
-                imported += 1
+        for log_file in log_files:
+            scanned += 1
+            imported += import_log_file(conn, log_file, force=force or bool(getattr(args, "log_file", None)))
         conn.commit()
-    return {"ok": True, "log_file": log_file, "imported": imported}
+    return {"ok": True, "scanned": scanned, "imported": imported}
+
+
+def sync_logs_if_available(args):
+    try:
+        return import_logs(args, missing_ok=True)
+    except Exception:
+        return {"ok": False, "scanned": 0, "imported": 0}
 
 
 def add_event(conn, book_id, event_type, message="", payload=None):
@@ -300,6 +407,7 @@ def add_event(conn, book_id, event_type, message="", payload=None):
 
 
 def stats(args):
+    sync_logs_if_available(args)
     with connect(db_path(args)) as conn:
         init_db(conn)
         rows = conn.execute("SELECT status, COUNT(*) AS count FROM books GROUP BY status").fetchall()
@@ -311,6 +419,7 @@ def stats(args):
 
 
 def list_books(args):
+    sync_logs_if_available(args)
     clauses = []
     values = []
     if args.status and args.status != "all":

@@ -17,8 +17,8 @@ ENV PORT=3000
 
 WORKDIR /booktree
 
-COPY package.json ./
-RUN npm install
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 COPY . /booktree/
 RUN echo "**** installing system packages ****" \
