@@ -46,6 +46,38 @@ options:
 2. copy default_config.cfg into config.json and modify with your paths settings (files, source_path, media_path)
 3. if using MAM as a source, create a MAM session ID and set the value in config.json file (/Config/session)
 
+## Web UI
+
+The Docker image now starts a Next.js web UI on port `3000`. The UI is for exception handling: import the latest Booktree CSV log, review books that need metadata or matching, edit fields, run targeted MAM/Audible searches, accept a candidate, and reprocess one book at a time.
+
+Operational state is stored in SQLite at:
+
+~~~
+/config/booktree.db
+~~~
+
+The existing CLI still works inside the container:
+
+~~~
+docker exec -it booktree /venv/bin/python booktree.py /config/config.json
+~~~
+
+To expose the UI in Docker Compose:
+
+~~~
+services:
+  booktree:
+    image: ghcr.io/magicwagon/booktree:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - /path/to/booktree/config:/config
+      - /path/to/booktree/logs:/logs
+      - /path/to/media:/data
+~~~
+
+If Booktree is behind Gluetun, expose the port on the Gluetun service instead and keep Booktree using `network_mode: "service:gluetun"`.
+
 ### Mousehole Integration
 
 booktree can use [mousehole](https://github.com/t-mart/mousehole) to read the current MAM session cookie from mousehole's `state.json` file. This avoids manually updating `/Config/session` when your IP address changes and mousehole rotates the cookie.
@@ -128,4 +160,3 @@ services:
   **Q:  My metadata is not producing any match, what can I do?**
   <p>A: Lower the matchrate, Change the fuzzy_match algorith, Set --fixid3 flag.</p>
   
-

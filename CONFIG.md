@@ -83,6 +83,16 @@ A copy of default_config.cfg can be found under the /templates folder.  It is re
 | | kw_ignore_words     | Characters ignored when optimizing keywords for search| ["the","and","m4b","mp3","series","audiobook","audiobooks", "book", "part", "track", "novel", "disc"]    |
 | | title_patterns      | ignores these patterns when alt Title is generated from bad id3 data | ["-end", "\bpart\b", "\btrack\b", "\bof\b",  "\bbook\b", "m4b", "\\(", "\\)", "_", "\\[", "\\]", "\\.", "\\s?-\\s?"]    |
 
+## Web UI State
+
+The web UI stores durable exception state in SQLite at `/config/booktree.db` by default. This is separate from the existing JSON config file and CSV logs:
+
+* `/config/config.json` remains the Booktree runtime configuration.
+* `/logs/booktree_log_*.csv` remains useful for export and debugging.
+* `/config/booktree.db` stores outstanding items, edited metadata, searches, accepted matches, jobs, and audit events.
+
+You can override the database path with the `BOOKTREE_DB` environment variable if needed.
+
 ## Mousehole
 
 booktree can read the current MAM session cookie from [mousehole](https://github.com/t-mart/mousehole), which avoids manually updating `Config/session` when your IP changes. Enable it in your config file:

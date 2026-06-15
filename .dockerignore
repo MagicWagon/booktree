@@ -3,11 +3,13 @@
 .DS_Store 
 __pycache__
 __cache__
+node_modules
+.next
+.npm
 logs/*
 config/*
 *.sh
 *.csv
-*.json
 private.txt
 *.pkl
 mousearr.py
