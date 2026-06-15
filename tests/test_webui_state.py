@@ -93,6 +93,16 @@ class WebUiStateTests(unittest.TestCase):
             booktree_worker.init_db(conn)
             return [dict(row) for row in conn.execute("SELECT * FROM books ORDER BY id").fetchall()]
 
+    def group_rows(self, db):
+        with booktree_worker.connect(db) as conn:
+            booktree_worker.init_db(conn)
+            return [dict(row) for row in conn.execute("SELECT * FROM book_groups ORDER BY id").fetchall()]
+
+    def file_rows(self, db):
+        with booktree_worker.connect(db) as conn:
+            booktree_worker.init_db(conn)
+            return [dict(row) for row in conn.execute("SELECT * FROM book_files ORDER BY id").fetchall()]
+
     def write_log(self, path, rows):
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(base_row().keys()))
@@ -117,7 +127,7 @@ class WebUiStateTests(unittest.TestCase):
             db = self.db_file(tmp)
             no_match = FakeBook(base_row(book="No Match", file="/data/source/no-match.m4b"))
             needs_metadata = FakeBook(
-                base_row(book="Needs Metadata", file="/data/source/needs.m4b", id3_title="", id3_authors="")
+                base_row(book="Needs Metadata", file="/data/source/needs.m4b")
             )
             needs_metadata.row["id3-title"] = ""
             needs_metadata.row["id3-authors"] = ""
@@ -167,6 +177,93 @@ class WebUiStateTests(unittest.TestCase):
                 booktree_worker.sync_books_safely([FakeBook(base_row())], FakeConfig(), db_file="/bad/db")
 
         self.assertIn("Warning: failed to update Booktree web UI state", output.getvalue())
+
+    def test_mp3_tracks_in_same_folder_group_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            booktree_worker.sync_books(
+                [
+                    FakeBook(base_row(file="/data/source/Book/01 Track.mp3", book="Book", **{"id3-title": "Chapter 1"})),
+                    FakeBook(base_row(file="/data/source/Book/02 Track.mp3", book="Book", **{"id3-title": "Chapter 2"})),
+                ],
+                FakeConfig(),
+                db_file=db,
+            )
+
+            groups = self.group_rows(db)
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["file_count"], 2)
+            self.assertEqual(groups[0]["detection_reason"], "track_like_files")
+
+    def test_distinct_asins_in_same_folder_need_split_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            booktree_worker.sync_books(
+                [
+                    FakeBook(base_row(file="/data/source/Mixed/book-a.mp3", book="Mixed", **{"id3-title": "Book A", "id3-asin": "A"})),
+                    FakeBook(base_row(file="/data/source/Mixed/book-b.mp3", book="Mixed", **{"id3-title": "Book B", "id3-asin": "B"})),
+                ],
+                FakeConfig(),
+                db_file=db,
+            )
+
+            group = self.group_rows(db)[0]
+            self.assertEqual(group["status"], "needs_split_review")
+            self.assertEqual(group["detection_reason"], "multiple_asins")
+
+    def test_manual_split_moves_files_to_new_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            booktree_worker.sync_books(
+                [
+                    FakeBook(base_row(file="/data/source/Mixed/book-a.mp3", book="Mixed", **{"id3-title": "Book A"})),
+                    FakeBook(base_row(file="/data/source/Mixed/book-b.mp3", book="Mixed", **{"id3-title": "Book B"})),
+                ],
+                FakeConfig(),
+                db_file=db,
+            )
+            group_id = self.group_rows(db)[0]["id"]
+            file_id = self.file_rows(db)[0]["id"]
+            args = Namespace(db=db, config="", id=group_id, file_ids=str(file_id), name="Book A")
+
+            result = booktree_worker.split_files(args)
+
+            self.assertTrue(result["ok"])
+            groups = self.group_rows(db)
+            self.assertEqual(len(groups), 2)
+            self.assertEqual(sorted(group["file_count"] for group in groups), [1, 1])
+
+    def test_manual_combine_moves_source_group_files_to_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            booktree_worker.sync_books(
+                [
+                    FakeBook(base_row(book="One", file="/data/source/one.mp3")),
+                    FakeBook(base_row(book="Two", file="/data/source/two.mp3")),
+                ],
+                FakeConfig(),
+                db_file=db,
+            )
+            groups = self.group_rows(db)
+            args = Namespace(db=db, config="", id=groups[0]["id"], source_ids=str(groups[1]["id"]))
+
+            result = booktree_worker.combine_groups(args)
+
+            self.assertTrue(result["ok"])
+            groups = self.group_rows(db)
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["file_count"], 2)
+
+    def test_group_metadata_edit_is_used_for_process_rows(self):
+        group = {"name": "Edited", "asin": "ASIN", "title": "Edited Title", "subtitle": "", "authors": "Author", "narrators": "", "series": "", "series_part": "", "language": "english", "source_path": "/data/source", "media_path": "/data/media", "paths": ""}
+        file_row = {"raw_log_json": "{}", "file": "/data/source/Book/01.mp3", "paths": "", "source_path": "/data/source", "media_path": "/data/media"}
+        match = {"provider": "adb", "asin": "ASIN", "title": "Edited Title", "subtitle": "", "authors": "Author", "narrators": "", "series": "", "language": "english"}
+
+        row = booktree_worker.log_row_for_group_file(group, file_row, match)
+
+        self.assertEqual(row["id3-asin"], "ASIN")
+        self.assertEqual(row["id3-title"], "Edited Title")
+        self.assertEqual(row["id3-authors"], "Author")
 
 
 if __name__ == "__main__":

@@ -58,6 +58,8 @@ Operational state is stored in SQLite at:
 
 Normal CLI runs write their processed book state directly to this database after the CSV log is written. Existing CSV logs can still be synced from the UI for backfill or recovery.
 
+The UI groups multi-file books into one visible item with a file drilldown. MP3/M4A track-style files in the same folder are grouped automatically, and suspicious folders with multiple titles or ASINs are flagged for split review. From the detail view, selected files can be split into a new group, moved to another group, or combined with another group.
+
 The existing CLI still works inside the container:
 
 ~~~

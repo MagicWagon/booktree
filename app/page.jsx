@@ -6,6 +6,7 @@ const statusLabels = {
   needs_metadata: "Needs metadata",
   no_match: "No match",
   multiple_matches: "Multiple matches",
+  needs_split_review: "Split review",
   matched: "Matched",
   processed: "Processed",
   failed: "Failed",
@@ -48,6 +49,8 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [selectedFileIds, setSelectedFileIds] = useState([]);
+  const [targetGroupId, setTargetGroupId] = useState("");
 
   const selectedBook = useMemo(
     () => detail?.book || books.find((book) => book.id === selectedId),
@@ -73,6 +76,7 @@ export default function Home() {
     }
     const payload = await requestJson(`/api/books/${id}`);
     setDetail(payload);
+    setSelectedFileIds([]);
   }
 
   async function run(label, action) {
@@ -121,6 +125,16 @@ export default function Home() {
       ...current,
       book: { ...current.book, [field]: value },
     }));
+  }
+
+  function toggleFile(id) {
+    setSelectedFileIds((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+    );
+  }
+
+  function selectedGroupIds() {
+    return targetGroupId ? [Number(targetGroupId)] : [];
   }
 
   async function saveMetadata() {
@@ -219,6 +233,7 @@ export default function Home() {
                   <th>Book</th>
                   <th>Detected</th>
                   <th>Counts</th>
+                  <th>Files</th>
                   <th>Status</th>
                   <th>Last searched</th>
                 </tr>
@@ -242,6 +257,7 @@ export default function Home() {
                       <div className="small">MAM {book.mam_count || 0}</div>
                       <div className="small">Audible {book.audible_count || 0}</div>
                     </td>
+                    <td className="small">{book.file_count || 1}</td>
                     <td>
                       <span className={`badge ${book.status}`}>{statusLabels[book.status] || book.status}</span>
                       {book.failure_reason ? <div className="small">{book.failure_reason}</div> : null}
@@ -275,6 +291,10 @@ export default function Home() {
                 <div className="field full">
                   <label>Source</label>
                   <input value={detail.book.source_path || ""} readOnly />
+                </div>
+                <div className="field full">
+                  <label>Detection</label>
+                  <input value={`${detail.book.detection_reason || "unknown"} (${detail.book.file_count || 0} files)`} readOnly />
                 </div>
               </div>
               <div className="actions">
@@ -312,6 +332,101 @@ export default function Home() {
                 >
                   Mark Ignored
                 </button>
+              </div>
+              <div className="file-drilldown">
+                <div className="panel-header inline">
+                  <h2>Files</h2>
+                  <span className="small">{selectedFileIds.length} selected</span>
+                </div>
+                <div className="table-wrap compact">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th></th>
+                        <th>File</th>
+                        <th>Detected</th>
+                        <th>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(detail.files || []).map((file) => (
+                        <tr key={file.id}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={selectedFileIds.includes(file.id)}
+                              onChange={() => toggleFile(file.id)}
+                            />
+                          </td>
+                          <td>
+                            <div className="small">{file.file}</div>
+                          </td>
+                          <td>
+                            <div>{file.title || file.book_name || "Untitled"}</div>
+                            <div className="small">{file.authors || "Unknown author"}</div>
+                          </td>
+                          <td>
+                            <span className={`badge ${file.status}`}>{statusLabels[file.status] || file.status}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="actions">
+                  <button
+                    onClick={() =>
+                      run("split", async () => ({
+                        ...(await requestJson(`/api/books/${detail.book.id}/split`, {
+                          method: "POST",
+                          body: JSON.stringify({ fileIds: selectedFileIds }),
+                        })),
+                        message: "Created a new group from selected files",
+                      }))
+                    }
+                    disabled={!!busy || !selectedFileIds.length}
+                  >
+                    Split Selected
+                  </button>
+                  <select value={targetGroupId} onChange={(event) => setTargetGroupId(event.target.value)}>
+                    <option value="">Target group</option>
+                    {books
+                      .filter((book) => book.id !== detail.book.id)
+                      .map((book) => (
+                        <option key={book.id} value={book.id}>
+                          {book.name}
+                        </option>
+                      ))}
+                  </select>
+                  <button
+                    onClick={() =>
+                      run("combine", async () => ({
+                        ...(await requestJson(`/api/books/${detail.book.id}/combine`, {
+                          method: "POST",
+                          body: JSON.stringify({ groupIds: selectedGroupIds() }),
+                        })),
+                        message: "Combined groups",
+                      }))
+                    }
+                    disabled={!!busy || !targetGroupId}
+                  >
+                    Combine Target Into This
+                  </button>
+                  <button
+                    onClick={() =>
+                      run("move", async () => ({
+                        ...(await requestJson(`/api/books/${detail.book.id}/move`, {
+                          method: "POST",
+                          body: JSON.stringify({ targetId: Number(targetGroupId), fileIds: selectedFileIds }),
+                        })),
+                        message: "Moved selected files",
+                      }))
+                    }
+                    disabled={!!busy || !targetGroupId || !selectedFileIds.length}
+                  >
+                    Move Selected To Target
+                  </button>
+                </div>
               </div>
               {busy ? <div className="message">Working: {busy}</div> : null}
               <div className="matches">

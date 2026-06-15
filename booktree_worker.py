@@ -9,6 +9,8 @@ import os
 import sqlite3
 import tempfile
 import time
+import re
+import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from glob import glob
@@ -21,6 +23,7 @@ STATUSES = [
     "needs_metadata",
     "no_match",
     "multiple_matches",
+    "needs_split_review",
     "matched",
     "processed",
     "failed",
@@ -153,6 +156,95 @@ def init_db(conn):
             imported_rows INTEGER NOT NULL DEFAULT 0,
             imported_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS book_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_hash TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            source_path TEXT,
+            media_path TEXT,
+            source_folder TEXT,
+            paths TEXT,
+            status TEXT NOT NULL DEFAULT 'needs_metadata',
+            failure_reason TEXT,
+            asin TEXT,
+            title TEXT,
+            subtitle TEXT,
+            authors TEXT,
+            narrators TEXT,
+            series TEXT,
+            series_part TEXT,
+            language TEXT,
+            metadata_source TEXT,
+            mam_count INTEGER NOT NULL DEFAULT 0,
+            audible_count INTEGER NOT NULL DEFAULT 0,
+            is_matched INTEGER NOT NULL DEFAULT 0,
+            is_hardlinked INTEGER NOT NULL DEFAULT 0,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            detection_reason TEXT,
+            detection_confidence REAL NOT NULL DEFAULT 1.0,
+            user_edited INTEGER NOT NULL DEFAULT 0,
+            last_searched_at TEXT,
+            updated_at TEXT NOT NULL,
+            raw_log_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS book_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_hash TEXT NOT NULL UNIQUE,
+            group_id INTEGER NOT NULL REFERENCES book_groups(id) ON DELETE CASCADE,
+            legacy_book_id INTEGER REFERENCES books(id) ON DELETE SET NULL,
+            book_name TEXT,
+            file TEXT,
+            source_path TEXT,
+            media_path TEXT,
+            paths TEXT,
+            status TEXT NOT NULL DEFAULT 'needs_metadata',
+            asin TEXT,
+            title TEXT,
+            authors TEXT,
+            narrators TEXT,
+            series TEXT,
+            language TEXT,
+            metadata_source TEXT,
+            mam_count INTEGER NOT NULL DEFAULT 0,
+            audible_count INTEGER NOT NULL DEFAULT 0,
+            is_matched INTEGER NOT NULL DEFAULT 0,
+            is_hardlinked INTEGER NOT NULL DEFAULT 0,
+            raw_log_json TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS group_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL REFERENCES book_groups(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            external_id TEXT,
+            asin TEXT,
+            title TEXT,
+            subtitle TEXT,
+            authors TEXT,
+            narrators TEXT,
+            series TEXT,
+            language TEXT,
+            duration TEXT,
+            match_rate REAL,
+            is_accepted INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS group_search_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL REFERENCES book_groups(id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            query_json TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            best_match_id INTEGER,
+            error TEXT,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
         """
     )
     conn.commit()
@@ -191,6 +283,60 @@ def to_int(value):
 def identity_for(row):
     key = "|".join([clean(row.get("sourcePath")), clean(row.get("file")), clean(row.get("book"))])
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def hash_value(*parts):
+    return hashlib.sha256("|".join(clean(part) for part in parts).encode("utf-8")).hexdigest()
+
+
+def source_folder_for(row):
+    source = clean(row.get("sourcePath"))
+    file_path = clean(row.get("file"))
+    if not file_path:
+        return clean(row.get("book"))
+    try:
+        rel = os.path.relpath(file_path, source) if source and os.path.isabs(file_path) else file_path
+    except ValueError:
+        rel = file_path
+    parent = os.path.dirname(rel)
+    return parent or clean(row.get("book")) or os.path.basename(file_path)
+
+
+def group_hash_for(row):
+    source = clean(row.get("sourcePath"))
+    media = clean(row.get("mediaPath"))
+    book = clean(row.get("book"))
+    folder = source_folder_for(row)
+    group_name = book or folder or clean(row.get("file"))
+    return hash_value(source, media, group_name)
+
+
+def track_like_filename(file_path):
+    name = os.path.splitext(os.path.basename(clean(file_path)))[0].lower()
+    return bool(
+        re.search(r"(^|\b)(cd|disc|disk|track|chapter|part)\s*[-_. ]*\d+", name)
+        or re.search(r"^\d{1,4}(\s|-|_|\.|$)", name)
+        or re.search(r"^\d{1,2}-\d{1,3}(\s|-|_|\.|$)", name)
+    )
+
+
+def suspect_group_from_files(rows):
+    if len(rows) <= 1:
+        return False, "single_file", 1.0
+    asins = {clean(row["asin"]).lower() for row in rows if clean(row["asin"])}
+    titles = {clean(row["title"]).lower() for row in rows if clean(row["title"])}
+    authors = {clean(row["authors"]).lower() for row in rows if clean(row["authors"])}
+    files = [clean(row["file"]) for row in rows]
+    all_track_like = all(track_like_filename(file_path) for file_path in files if file_path)
+    if len(asins) > 1:
+        return True, "multiple_asins", 0.35
+    if len(titles) > 1 and len(authors) > 1 and not all_track_like:
+        return True, "multiple_titles_and_authors", 0.45
+    if len(titles) > 3 and not all_track_like:
+        return True, "many_distinct_titles", 0.5
+    if all_track_like:
+        return False, "track_like_files", 0.9
+    return False, "shared_folder", 0.75
 
 
 def status_from_log(row, existing_status=None):
@@ -248,6 +394,47 @@ def book_payload_from_log(row, existing_status=None):
     }
 
 
+def group_payload_from_log(row, existing_status=None):
+    payload = book_payload_from_log(row, existing_status)
+    payload.pop("identity_hash", None)
+    payload.pop("file", None)
+    payload["group_hash"] = group_hash_for(row)
+    payload["source_folder"] = source_folder_for(row)
+    payload["file_count"] = 1
+    payload["detection_reason"] = "initial_import"
+    payload["detection_confidence"] = 1.0
+    payload["user_edited"] = 0
+    return payload
+
+
+def file_payload_from_log(row, group_id, legacy_book_id=None):
+    payload = book_payload_from_log(row)
+    return {
+        "file_hash": identity_for(row),
+        "group_id": group_id,
+        "legacy_book_id": legacy_book_id,
+        "book_name": payload["name"],
+        "file": payload["file"],
+        "source_path": payload["source_path"],
+        "media_path": payload["media_path"],
+        "paths": payload["paths"],
+        "status": payload["status"],
+        "asin": payload["asin"],
+        "title": payload["title"],
+        "authors": payload["authors"],
+        "narrators": payload["narrators"],
+        "series": payload["series"],
+        "language": payload["language"],
+        "metadata_source": payload["metadata_source"],
+        "mam_count": payload["mam_count"],
+        "audible_count": payload["audible_count"],
+        "is_matched": payload["is_matched"],
+        "is_hardlinked": payload["is_hardlinked"],
+        "raw_log_json": payload["raw_log_json"],
+        "updated_at": payload["updated_at"],
+    }
+
+
 def upsert_book(conn, payload):
     existing = conn.execute(
         "SELECT id, status FROM books WHERE identity_hash = ?", (payload["identity_hash"],)
@@ -270,6 +457,133 @@ def upsert_book(conn, payload):
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def upsert_group(conn, payload):
+    existing = conn.execute(
+        "SELECT id, status, user_edited FROM book_groups WHERE group_hash = ?", (payload["group_hash"],)
+    ).fetchone()
+    if existing:
+        if existing["status"] == "ignored":
+            payload["status"] = "ignored"
+        if existing["user_edited"]:
+            for field in ["asin", "title", "subtitle", "authors", "narrators", "series", "series_part", "language"]:
+                payload.pop(field, None)
+            payload["user_edited"] = 1
+        fields = [key for key in payload.keys() if key != "group_hash"]
+        conn.execute(
+            f"UPDATE book_groups SET {', '.join(f'{field} = ?' for field in fields)} WHERE group_hash = ?",
+            [payload[field] for field in fields] + [payload["group_hash"]],
+        )
+        return existing["id"]
+
+    fields = list(payload.keys())
+    conn.execute(
+        f"INSERT INTO book_groups ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+        [payload[field] for field in fields],
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def upsert_file(conn, payload):
+    existing = conn.execute("SELECT id FROM book_files WHERE file_hash = ?", (payload["file_hash"],)).fetchone()
+    if existing:
+        fields = [key for key in payload.keys() if key != "file_hash"]
+        conn.execute(
+            f"UPDATE book_files SET {', '.join(f'{field} = ?' for field in fields)} WHERE file_hash = ?",
+            [payload[field] for field in fields] + [payload["file_hash"]],
+        )
+        return existing["id"]
+
+    fields = list(payload.keys())
+    conn.execute(
+        f"INSERT INTO book_files ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+        [payload[field] for field in fields],
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def group_status_from_files(rows, existing_status=None):
+    if existing_status == "ignored":
+        return "ignored"
+    suspect, _reason, _confidence = suspect_group_from_files(rows)
+    if suspect:
+        return "needs_split_review"
+    if rows and all(row["is_hardlinked"] for row in rows):
+        return "processed"
+    if rows and all(row["is_matched"] for row in rows):
+        return "matched"
+    if any(row["status"] == "failed" for row in rows):
+        return "failed"
+    if any(row["status"] == "needs_metadata" for row in rows):
+        return "needs_metadata"
+    if sum(int(row["mam_count"] or 0) + int(row["audible_count"] or 0) for row in rows) > 1:
+        return "multiple_matches"
+    return "no_match"
+
+
+def recompute_group(conn, group_id):
+    group = conn.execute("SELECT * FROM book_groups WHERE id = ?", (group_id,)).fetchone()
+    if not group:
+        return
+    rows = conn.execute("SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (group_id,)).fetchall()
+    if not rows:
+        return
+    first_row = rows[0]
+    suspect, reason, confidence = suspect_group_from_files(rows)
+    status = group_status_from_files(rows, group["status"])
+    if group["status"] == "ignored":
+        status = "ignored"
+    metadata = {}
+    if not group["user_edited"]:
+        metadata = {
+            "asin": first(*(row["asin"] for row in rows)),
+            "title": first(*(row["title"] for row in rows), group["name"]),
+            "authors": first(*(row["authors"] for row in rows)),
+            "narrators": first(*(row["narrators"] for row in rows)),
+            "series": first(*(row["series"] for row in rows)),
+            "language": first(*(row["language"] for row in rows), "english"),
+        }
+    conn.execute(
+        f"""
+        UPDATE book_groups
+        SET status = ?,
+            failure_reason = ?,
+            mam_count = ?,
+            audible_count = ?,
+            is_matched = ?,
+            is_hardlinked = ?,
+            file_count = ?,
+            detection_reason = ?,
+            detection_confidence = ?,
+            updated_at = ?
+            {''.join(f', {field} = ?' for field in metadata.keys())}
+        WHERE id = ?
+        """,
+        [
+            status,
+            "Possible multiple books in one folder" if suspect else ("" if status != "no_match" else "No accepted Booktree match"),
+            sum(int(row["mam_count"] or 0) for row in rows),
+            sum(int(row["audible_count"] or 0) for row in rows),
+            1 if all(row["is_matched"] for row in rows) else 0,
+            1 if all(row["is_hardlinked"] for row in rows) else 0,
+            len(rows),
+            reason,
+            confidence,
+            now(),
+            *metadata.values(),
+            group_id,
+        ],
+    )
+
+
+def upsert_grouped_row(conn, row, source="imported"):
+    legacy_id = upsert_book(conn, book_payload_from_log(row))
+    group_id = upsert_group(conn, group_payload_from_log(row))
+    upsert_file(conn, file_payload_from_log(row, group_id, legacy_id))
+    recompute_group(conn, group_id)
+    add_event(conn, legacy_id, source, f"{source} grouped file row", {"group_id": group_id})
+    return legacy_id, group_id
+
+
 def book_to_log_rows(book, cfg):
     rows = []
     for book_file in getattr(book, "files", []):
@@ -285,9 +599,7 @@ def sync_books(books, cfg, db_file=None, source="cli"):
         init_db(conn)
         for book in books:
             for row in book_to_log_rows(book, cfg):
-                payload = book_payload_from_log(row)
-                book_id = upsert_book(conn, payload)
-                add_event(conn, book_id, "synced", f"Synced from {source}", {"source": source})
+                upsert_grouped_row(conn, row, "synced")
                 synced += 1
         conn.commit()
     return synced
@@ -360,9 +672,7 @@ def import_log_file(conn, log_file, force=False):
         for row in reader:
             if not clean(row.get("book")) and not clean(row.get("file")):
                 continue
-            payload = book_payload_from_log(row)
-            book_id = upsert_book(conn, payload)
-            add_event(conn, book_id, "imported", f"Imported from {log_file}", {"log_file": log_file})
+            upsert_grouped_row(conn, row, "imported")
             imported += 1
     mark_log_imported(conn, log_file, imported)
     return imported
@@ -394,9 +704,57 @@ def import_logs(args, force=False, missing_ok=False):
 
 def sync_logs_if_available(args):
     try:
-        return import_logs(args, missing_ok=True)
+        result = import_logs(args, missing_ok=True)
+        with connect(db_path(args)) as conn:
+            init_db(conn)
+            migrate_legacy_books(conn)
+            conn.commit()
+        return result
     except Exception:
         return {"ok": False, "scanned": 0, "imported": 0}
+
+
+def row_from_legacy_book(book):
+    raw = {}
+    try:
+        raw = json.loads(book["raw_log_json"] or "{}")
+    except Exception:
+        raw = {}
+    raw.update(
+        {
+            "book": raw.get("book") or book["name"],
+            "file": raw.get("file") or book["file"],
+            "paths": raw.get("paths") or book["paths"],
+            "isMatched": raw.get("isMatched") if "isMatched" in raw else bool(book["is_matched"]),
+            "isHardLinked": raw.get("isHardLinked") if "isHardLinked" in raw else bool(book["is_hardlinked"]),
+            "mamCount": raw.get("mamCount") or book["mam_count"],
+            "audibleMatchCount": raw.get("audibleMatchCount") or book["audible_count"],
+            "metadatasource": raw.get("metadatasource") or book["metadata_source"],
+            "id3-asin": raw.get("id3-asin") or book["asin"],
+            "id3-title": raw.get("id3-title") or book["title"],
+            "id3-subtitle": raw.get("id3-subtitle") or book["subtitle"],
+            "id3-authors": raw.get("id3-authors") or book["authors"],
+            "id3-narrators": raw.get("id3-narrators") or book["narrators"],
+            "id3-seriesparts": raw.get("id3-seriesparts") or book["series_part"] or book["series"],
+            "id3-language": raw.get("id3-language") or book["language"],
+            "sourcePath": raw.get("sourcePath") or book["source_path"],
+            "mediaPath": raw.get("mediaPath") or book["media_path"],
+        }
+    )
+    return raw
+
+
+def migrate_legacy_books(conn):
+    rows = conn.execute(
+        """
+        SELECT b.*
+        FROM books b
+        LEFT JOIN book_files f ON f.legacy_book_id = b.id
+        WHERE f.id IS NULL
+        """
+    ).fetchall()
+    for row in rows:
+        upsert_grouped_row(conn, row_from_legacy_book(row), "migrated")
 
 
 def add_event(conn, book_id, event_type, message="", payload=None):
@@ -406,11 +764,18 @@ def add_event(conn, book_id, event_type, message="", payload=None):
     )
 
 
+def add_group_event(conn, group_id, event_type, message="", payload=None):
+    conn.execute(
+        "INSERT INTO events (book_id, type, message, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (None, event_type, message, json.dumps({"group_id": group_id, **(payload or {})}), now()),
+    )
+
+
 def stats(args):
     sync_logs_if_available(args)
     with connect(db_path(args)) as conn:
         init_db(conn)
-        rows = conn.execute("SELECT status, COUNT(*) AS count FROM books GROUP BY status").fetchall()
+        rows = conn.execute("SELECT status, COUNT(*) AS count FROM book_groups GROUP BY status").fetchall()
     counts = {status: 0 for status in STATUSES}
     for row in rows:
         counts[row["status"]] = row["count"]
@@ -433,13 +798,14 @@ def list_books(args):
         init_db(conn)
         rows = conn.execute(
             f"""
-            SELECT * FROM books
+            SELECT * FROM book_groups
             {where}
             ORDER BY
               CASE status
                 WHEN 'needs_metadata' THEN 1
                 WHEN 'no_match' THEN 2
                 WHEN 'multiple_matches' THEN 3
+                WHEN 'needs_split_review' THEN 4
                 WHEN 'failed' THEN 4
                 WHEN 'matched' THEN 5
                 WHEN 'processed' THEN 6
@@ -454,18 +820,22 @@ def list_books(args):
 
 
 def get_book(conn, book_id):
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    book = conn.execute("SELECT * FROM book_groups WHERE id = ?", (book_id,)).fetchone()
     if not book:
-        raise ValueError(f"Book {book_id} was not found")
+        raise ValueError(f"Book group {book_id} was not found")
     matches = conn.execute(
-        "SELECT * FROM matches WHERE book_id = ? ORDER BY is_accepted DESC, match_rate DESC, id DESC",
+        "SELECT * FROM group_matches WHERE group_id = ? ORDER BY is_accepted DESC, match_rate DESC, id DESC",
         (book_id,),
     ).fetchall()
     attempts = conn.execute(
-        "SELECT * FROM search_attempts WHERE book_id = ? ORDER BY id DESC LIMIT 10", (book_id,)
+        "SELECT * FROM group_search_attempts WHERE group_id = ? ORDER BY id DESC LIMIT 10", (book_id,)
+    ).fetchall()
+    files = conn.execute(
+        "SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (book_id,)
     ).fetchall()
     return {
         "book": row_to_dict(book),
+        "files": [row_to_dict(row) for row in files],
         "matches": [row_to_dict(row) for row in matches],
         "search_attempts": [row_to_dict(row) for row in attempts],
     }
@@ -497,10 +867,10 @@ def update_book(args):
     with connect(db_path(args)) as conn:
         init_db(conn)
         conn.execute(
-            f"UPDATE books SET {', '.join(f'{field} = ?' for field in fields)}, updated_at = ? WHERE id = ?",
+            f"UPDATE book_groups SET {', '.join(f'{field} = ?' for field in fields)}, user_edited = 1, updated_at = ? WHERE id = ?",
             [clean(payload[field]) for field in fields] + [now(), args.id],
         )
-        add_event(conn, args.id, "updated", "Metadata updated from web UI", {field: payload[field] for field in fields})
+        add_group_event(conn, args.id, "updated", "Metadata updated from web UI", {field: payload[field] for field in fields})
         conn.commit()
         payload = get_book(conn, args.id)
     return {"ok": True, **payload}
@@ -555,7 +925,7 @@ def insert_matches(conn, book_id, matches):
     ids = []
     for match in matches:
         fields = [
-            "book_id",
+            "group_id",
             "provider",
             "external_id",
             "asin",
@@ -572,7 +942,7 @@ def insert_matches(conn, book_id, matches):
         ]
         values = [book_id] + [match.get(field, "") for field in fields[1:-1]] + [now()]
         conn.execute(
-            f"INSERT INTO matches ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+            f"INSERT INTO group_matches ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
             values,
         )
         ids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -625,13 +995,13 @@ def search_provider(conn, cfg, book, provider):
     duration_ms = int((time.monotonic() - start) * 1000)
     conn.execute(
         """
-        INSERT INTO search_attempts
-          (book_id, provider, query_json, result_count, best_match_id, error, duration_ms, created_at)
+        INSERT INTO group_search_attempts
+          (group_id, provider, query_json, result_count, best_match_id, error, duration_ms, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (book["id"], provider, json.dumps(query), len(matches), best_id, error, duration_ms, now()),
     )
-    add_event(
+    add_group_event(
         conn,
         book["id"],
         "searched",
@@ -646,10 +1016,10 @@ def search_book(args):
     cfg = DictConfig(config_data(config_path(args)))
     with connect(db_path(args)) as conn:
         init_db(conn)
-        conn.execute("DELETE FROM matches WHERE book_id = ? AND is_accepted = 0", (args.id,))
-        book = row_to_dict(conn.execute("SELECT * FROM books WHERE id = ?", (args.id,)).fetchone())
+        conn.execute("DELETE FROM group_matches WHERE group_id = ? AND is_accepted = 0", (args.id,))
+        book = row_to_dict(conn.execute("SELECT * FROM book_groups WHERE id = ?", (args.id,)).fetchone())
         if not book:
-            raise ValueError(f"Book {args.id} was not found")
+            raise ValueError(f"Book group {args.id} was not found")
         results = [search_provider(conn, cfg, book, provider) for provider in providers]
         mam_count = sum(len(result["matches"]) for result in results if result["provider"] == "mam")
         audible_count = sum(len(result["matches"]) for result in results if result["provider"] == "audible")
@@ -660,7 +1030,7 @@ def search_book(args):
             status = "failed"
         conn.execute(
             """
-            UPDATE books
+            UPDATE book_groups
             SET status = ?, mam_count = ?, audible_count = ?, last_searched_at = ?, updated_at = ?,
                 failure_reason = ?
             WHERE id = ?
@@ -684,18 +1054,18 @@ def accept_match(args):
     with connect(db_path(args)) as conn:
         init_db(conn)
         match = conn.execute(
-            "SELECT * FROM matches WHERE id = ? AND book_id = ?", (args.match_id, args.id)
+            "SELECT * FROM group_matches WHERE id = ? AND group_id = ?", (args.match_id, args.id)
         ).fetchone()
         if not match:
             raise ValueError("Match was not found")
-        conn.execute("UPDATE matches SET is_accepted = 0 WHERE book_id = ?", (args.id,))
-        conn.execute("UPDATE matches SET is_accepted = 1 WHERE id = ?", (args.match_id,))
+        conn.execute("UPDATE group_matches SET is_accepted = 0 WHERE group_id = ?", (args.id,))
+        conn.execute("UPDATE group_matches SET is_accepted = 1 WHERE id = ?", (args.match_id,))
         conn.execute(
             """
-            UPDATE books
+            UPDATE book_groups
             SET asin = ?, title = ?, subtitle = ?, authors = ?, narrators = ?, series = ?,
                 language = ?, status = 'matched', is_matched = 1, metadata_source = ?,
-                failure_reason = '', updated_at = ?
+                failure_reason = '', user_edited = 1, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -711,7 +1081,7 @@ def accept_match(args):
                 args.id,
             ),
         )
-        add_event(conn, args.id, "match_accepted", f"Accepted {match['provider']} match", {"match_id": args.match_id})
+        add_group_event(conn, args.id, "match_accepted", f"Accepted {match['provider']} match", {"match_id": args.match_id})
         conn.commit()
         payload = get_book(conn, args.id)
     return {"ok": True, **payload}
@@ -721,11 +1091,118 @@ def mark_ignored(args):
     with connect(db_path(args)) as conn:
         init_db(conn)
         conn.execute(
-            "UPDATE books SET status = 'ignored', updated_at = ? WHERE id = ?", (now(), args.id)
+            "UPDATE book_groups SET status = 'ignored', updated_at = ? WHERE id = ?", (now(), args.id)
         )
-        add_event(conn, args.id, "ignored", "Marked ignored from web UI")
+        add_group_event(conn, args.id, "ignored", "Marked ignored from web UI")
         conn.commit()
         payload = get_book(conn, args.id)
+    return {"ok": True, **payload}
+
+
+def split_files(args):
+    file_ids = [int(value) for value in args.file_ids.split(",") if value.strip()]
+    if not file_ids:
+        raise ValueError("No files selected")
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        source = conn.execute("SELECT * FROM book_groups WHERE id = ?", (args.id,)).fetchone()
+        if not source:
+            raise ValueError("Source group was not found")
+        files = conn.execute(
+            f"SELECT * FROM book_files WHERE group_id = ? AND id IN ({','.join('?' for _ in file_ids)})",
+            [args.id] + file_ids,
+        ).fetchall()
+        if not files:
+            raise ValueError("Selected files were not found in this group")
+        first_file = files[0]
+        group_hash = f"manual:{uuid.uuid4()}"
+        payload = {
+            "group_hash": group_hash,
+            "name": args.name or first(first_file["title"], first_file["book_name"], source["name"]),
+            "source_path": source["source_path"],
+            "media_path": source["media_path"],
+            "source_folder": source["source_folder"],
+            "status": first_file["status"],
+            "failure_reason": "",
+            "asin": first_file["asin"],
+            "title": first_file["title"],
+            "subtitle": "",
+            "authors": first_file["authors"],
+            "narrators": first_file["narrators"],
+            "series": first_file["series"],
+            "series_part": "",
+            "language": first(first_file["language"], "english"),
+            "metadata_source": first_file["metadata_source"],
+            "mam_count": first_file["mam_count"],
+            "audible_count": first_file["audible_count"],
+            "is_matched": first_file["is_matched"],
+            "is_hardlinked": first_file["is_hardlinked"],
+            "file_count": len(files),
+            "detection_reason": "manual_split",
+            "detection_confidence": 1.0,
+            "user_edited": 1,
+            "last_searched_at": None,
+            "updated_at": now(),
+            "raw_log_json": first_file["raw_log_json"],
+        }
+        new_group_id = upsert_group(conn, payload)
+        conn.execute(
+            f"UPDATE book_files SET group_id = ?, updated_at = ? WHERE id IN ({','.join('?' for _ in file_ids)})",
+            [new_group_id, now()] + file_ids,
+        )
+        recompute_group(conn, args.id)
+        recompute_group(conn, new_group_id)
+        add_group_event(conn, args.id, "split", "Split selected files into a new group", {"new_group_id": new_group_id, "file_ids": file_ids})
+        add_group_event(conn, new_group_id, "created_by_split", "Created from split", {"source_group_id": args.id, "file_ids": file_ids})
+        conn.commit()
+        payload = get_book(conn, new_group_id)
+    return {"ok": True, "new_group_id": new_group_id, **payload}
+
+
+def combine_groups(args):
+    source_ids = [int(value) for value in args.source_ids.split(",") if value.strip()]
+    source_ids = [value for value in source_ids if value != args.id]
+    if not source_ids:
+        return get_book_command(args)
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        target = conn.execute("SELECT * FROM book_groups WHERE id = ?", (args.id,)).fetchone()
+        if not target:
+            raise ValueError("Target group was not found")
+        conn.execute(
+            f"UPDATE book_files SET group_id = ?, updated_at = ? WHERE group_id IN ({','.join('?' for _ in source_ids)})",
+            [args.id, now()] + source_ids,
+        )
+        conn.execute(
+            f"DELETE FROM book_groups WHERE id IN ({','.join('?' for _ in source_ids)})",
+            source_ids,
+        )
+        recompute_group(conn, args.id)
+        add_group_event(conn, args.id, "combined", "Combined groups", {"source_group_ids": source_ids})
+        conn.commit()
+        payload = get_book(conn, args.id)
+    return {"ok": True, **payload}
+
+
+def move_files(args):
+    file_ids = [int(value) for value in args.file_ids.split(",") if value.strip()]
+    if not file_ids:
+        raise ValueError("No files selected")
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        target = conn.execute("SELECT id FROM book_groups WHERE id = ?", (args.target_id,)).fetchone()
+        if not target:
+            raise ValueError("Target group was not found")
+        conn.execute(
+            f"UPDATE book_files SET group_id = ?, updated_at = ? WHERE group_id = ? AND id IN ({','.join('?' for _ in file_ids)})",
+            [args.target_id, now(), args.id] + file_ids,
+        )
+        recompute_group(conn, args.id)
+        recompute_group(conn, args.target_id)
+        add_group_event(conn, args.id, "files_moved_out", "Moved files to another group", {"target_group_id": args.target_id, "file_ids": file_ids})
+        add_group_event(conn, args.target_id, "files_moved_in", "Moved files from another group", {"source_group_id": args.id, "file_ids": file_ids})
+        conn.commit()
+        payload = get_book(conn, args.target_id)
     return {"ok": True, **payload}
 
 
@@ -733,7 +1210,7 @@ def create_job(conn, job_type, book_id):
     ts = now()
     conn.execute(
         "INSERT INTO jobs (type, book_id, status, logs, error, created_at, updated_at) VALUES (?, ?, 'running', '', '', ?, ?)",
-        (job_type, book_id, ts, ts),
+        (job_type, None, ts, ts),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -781,15 +1258,57 @@ def log_row_for_book(book, match):
     return raw
 
 
+def log_row_for_group_file(group, file_row, match):
+    raw = json.loads(file_row["raw_log_json"] or "{}")
+    raw.update(
+        {
+            "book": group["name"],
+            "file": file_row["file"],
+            "paths": file_row["paths"] or group["paths"],
+            "isMatched": "True",
+            "isHardLinked": "False",
+            "metadatasource": match["provider"],
+            "id3-asin": group["asin"] or "",
+            "id3-title": group["title"] or "",
+            "id3-subtitle": group["subtitle"] or "",
+            "id3-authors": group["authors"] or "",
+            "id3-narrators": group["narrators"] or "",
+            "id3-seriesparts": group["series_part"] or group["series"] or "",
+            "id3-language": group["language"] or "english",
+            "sourcePath": file_row["source_path"] or group["source_path"],
+            "mediaPath": file_row["media_path"] or group["media_path"],
+        }
+    )
+    prefix = "mam" if match["provider"] == "mam" else "adb"
+    raw.update(
+        {
+            f"{prefix}-asin": match["asin"] or "",
+            f"{prefix}-title": match["title"] or "",
+            f"{prefix}-subtitle": match["subtitle"] or "",
+            f"{prefix}-authors": match["authors"] or "",
+            f"{prefix}-narrators": match["narrators"] or "",
+            f"{prefix}-seriesparts": match["series"] or "",
+            f"{prefix}-language": match["language"] or "english",
+        }
+    )
+    return raw
+
+
 def process_book(args):
     with connect(db_path(args)) as conn:
         init_db(conn)
-        book = row_to_dict(conn.execute("SELECT * FROM books WHERE id = ?", (args.id,)).fetchone())
+        book = row_to_dict(conn.execute("SELECT * FROM book_groups WHERE id = ?", (args.id,)).fetchone())
         if not book:
-            raise ValueError(f"Book {args.id} was not found")
+            raise ValueError(f"Book group {args.id} was not found")
+        files = [
+            row_to_dict(row)
+            for row in conn.execute("SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (args.id,)).fetchall()
+        ]
+        if not files:
+            raise ValueError("Book group has no files to process")
         match = row_to_dict(
             conn.execute(
-                "SELECT * FROM matches WHERE book_id = ? AND is_accepted = 1 ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM group_matches WHERE group_id = ? AND is_accepted = 1 ORDER BY id DESC LIMIT 1",
                 (args.id,),
             ).fetchone()
         )
@@ -806,21 +1325,22 @@ def process_book(args):
 
         cfg_data = config_data(config_path(args))
         cfg_data.setdefault("Config", {})["metadata"] = "log"
-        headers = list(log_row_for_book(book, match).keys())
+        process_rows = [log_row_for_group_file(book, file_row, match) for file_row in files]
+        headers = list(process_rows[0].keys())
         try:
             import myx_utilities
 
             headers = list(myx_utilities.getLogHeaders().keys())
         except Exception:
             pass
-        row = log_row_for_book(book, match)
         with tempfile.TemporaryDirectory(prefix="booktree-webui-") as tmp:
             input_csv = os.path.join(tmp, "input.csv")
             output_csv = os.path.join(tmp, "output.csv")
             with open(input_csv, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=headers)
                 writer.writeheader()
-                writer.writerow({field: row.get(field, "") for field in headers})
+                for row in process_rows:
+                    writer.writerow({field: row.get(field, "") for field in headers})
             with contextlib.redirect_stdout(logs):
                 booktree.buildTreeFromLog(input_csv, output_csv, DictConfig(cfg_data))
     except Exception as exc:
@@ -831,10 +1351,14 @@ def process_book(args):
         init_db(conn)
         complete_job(conn, job_id, status, logs.getvalue(), error)
         conn.execute(
-            "UPDATE books SET status = ?, is_hardlinked = ?, failure_reason = ?, updated_at = ? WHERE id = ?",
+            "UPDATE book_groups SET status = ?, is_hardlinked = ?, failure_reason = ?, updated_at = ? WHERE id = ?",
             ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, error, now(), args.id),
         )
-        add_event(conn, args.id, "processed" if status == "complete" else "process_failed", error or "Processed from web UI")
+        conn.execute(
+            "UPDATE book_files SET status = ?, is_hardlinked = ?, updated_at = ? WHERE group_id = ?",
+            ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, now(), args.id),
+        )
+        add_group_event(conn, args.id, "processed" if status == "complete" else "process_failed", error or "Processed from web UI")
         conn.commit()
         payload = get_book(conn, args.id)
     return {"ok": status == "complete", "job_id": job_id, "logs": logs.getvalue(), "error": error, **payload}
@@ -872,6 +1396,17 @@ def main():
     accept_parser.add_argument("--match-id", type=int, required=True)
     ignore_parser = sub.add_parser("mark-ignored")
     ignore_parser.add_argument("--id", type=int, required=True)
+    split_parser = sub.add_parser("split-files")
+    split_parser.add_argument("--id", type=int, required=True)
+    split_parser.add_argument("--file-ids", required=True)
+    split_parser.add_argument("--name", default="")
+    combine_parser = sub.add_parser("combine-groups")
+    combine_parser.add_argument("--id", type=int, required=True)
+    combine_parser.add_argument("--source-ids", required=True)
+    move_parser = sub.add_parser("move-files")
+    move_parser.add_argument("--id", type=int, required=True)
+    move_parser.add_argument("--target-id", type=int, required=True)
+    move_parser.add_argument("--file-ids", required=True)
     process_parser = sub.add_parser("process")
     process_parser.add_argument("--id", type=int, required=True)
 
@@ -897,6 +1432,12 @@ def main():
             output(accept_match(args))
         elif args.command == "mark-ignored":
             output(mark_ignored(args))
+        elif args.command == "split-files":
+            output(split_files(args))
+        elif args.command == "combine-groups":
+            output(combine_groups(args))
+        elif args.command == "move-files":
+            output(move_files(args))
         elif args.command == "process":
             output(process_book(args))
     except Exception as exc:
