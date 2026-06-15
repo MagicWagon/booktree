@@ -19,6 +19,42 @@ from pathlib import Path
 
 DEFAULT_DB = "/config/booktree.db"
 DEFAULT_CONFIG = "/config/config.json"
+DEFAULT_CONFIG_DIR = "/config"
+CONFIG_DESCRIPTIONS = {
+    "metadata": "Metadata search mode. Common values are mam, audible, mam-audible, or log.",
+    "matchrate": "Minimum fuzzy match score required before Booktree treats a result as a match.",
+    "fuzzy_match": "Fuzzy matching strategy used for title comparisons. Common values are partial, token_sort, and ratio.",
+    "log_path": "Directory where Booktree writes CSV run logs.",
+    "cache_path": "Directory where Booktree stores cache and state files.",
+    "last_scan": "Path to the last scan log used by older workflows.",
+    "session": "Static MAM session cookie value used when mousehole is disabled or unavailable.",
+    "mousehole_enabled": "When enabled, Booktree reads the live MAM cookie from the mousehole state file.",
+    "mousehole_state_file": "Path to mousehole state.json. Booktree reads currentCookie from this file.",
+    "paths": "Input/output path mappings that tell Booktree where to scan and where to place media.",
+    "files": "Glob patterns to include when scanning this source path.",
+    "source_path": "Root folder where Booktree looks for source downloads.",
+    "media_path": "Destination media root for linked or copied books.",
+    "dry_run": "Preview actions without creating links, files, or OPF output.",
+    "verbose": "Print extra processing detail while Booktree runs.",
+    "multibook": "Treat files as separate books instead of grouping a folder as one book.",
+    "ebooks": "Enable ebook handling in addition to audiobook handling.",
+    "no_opf": "Skip writing OPF metadata files.",
+    "no_cache": "Bypass cached search results and force fresh lookups.",
+    "fixid3": "Attempt to repair or rewrite ID3 metadata for supported audio files.",
+    "add_narrators": "Add narrator names to generated metadata/path output where supported.",
+    "interactive": "Prompt for manual choices when running the CLI interactively.",
+    "hardlink": "Create hardlinks instead of copying files when possible.",
+    "ingest_calibre": "Enable Calibre ingest workflow for ebook imports.",
+    "multi_author": "Template behavior for books with multiple authors.",
+    "in_series": "Target path template for books that belong to a series.",
+    "no_series": "Target path template for books without series metadata.",
+    "disc_folder": "Folder naming template for multi-disc output.",
+    "calibre_ingest_path": "Folder where ebook files should be staged for Calibre import.",
+    "skip_series": "Ignore series metadata while building output paths.",
+    "kw_ignore": "Characters removed or ignored while cleaning search terms.",
+    "kw_ignore_words": "Words ignored while cleaning title/search terms.",
+    "title_patterns": "Regular expression patterns stripped from titles before matching.",
+}
 STATUSES = [
     "needs_metadata",
     "no_match",
@@ -55,16 +91,65 @@ def db_path(args):
     return args.db or os.environ.get("BOOKTREE_DB") or DEFAULT_DB
 
 
+def config_root(args=None):
+    return getattr(args, "config_dir", None) or os.environ.get("BOOKTREE_CONFIG_DIR") or DEFAULT_CONFIG_DIR
+
+
+def safe_config_path(value, args=None, must_exist=False):
+    if not clean(value):
+        raise ValueError("Config path is required")
+    root = Path(config_root(args)).resolve()
+    raw = Path(clean(value))
+    candidate = raw if raw.is_absolute() else root / raw
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Config files must be inside /config") from exc
+    if resolved.name.startswith("."):
+        raise ValueError("Hidden config files are not allowed")
+    if resolved.suffix.lower() != ".json":
+        raise ValueError("Config files must use a .json extension")
+    if must_exist and not resolved.exists():
+        raise ValueError(f"Config file was not found: {resolved}")
+    return str(resolved)
+
+
+def active_config_path(args):
+    try:
+        with connect(db_path(args)) as conn:
+            init_db(conn)
+            row = conn.execute("SELECT value FROM app_settings WHERE key = 'active_config_path'").fetchone()
+            if not row:
+                return None
+            path = safe_config_path(row["value"], args, must_exist=True)
+            return path
+    except Exception:
+        return None
+
+
 def config_path(args):
-    return args.config or os.environ.get("BOOKTREE_CONFIG") or DEFAULT_CONFIG
+    if getattr(args, "config", None):
+        return safe_config_path(args.config, args, must_exist=True)
+    active = active_config_path(args)
+    if active:
+        return active
+    env_config = os.environ.get("BOOKTREE_CONFIG")
+    if env_config:
+        return safe_config_path(env_config, args, must_exist=False)
+    return safe_config_path("config.json", args, must_exist=False)
 
 
+@contextlib.contextmanager
 def connect(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_db(conn):
@@ -244,6 +329,12 @@ def init_db(conn):
             error TEXT,
             duration_ms INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         """
     )
@@ -617,6 +708,125 @@ def sync_books_safely(books, cfg, db_file=None, source="cli"):
 def config_data(path):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def default_config_data():
+    template = Path(__file__).resolve().parent / "templates" / "default_config.cfg"
+    return config_data(str(template))
+
+
+def config_summary(path, args):
+    resolved = safe_config_path(path, args, must_exist=True)
+    stat = os.stat(resolved)
+    root = Path(config_root(args)).resolve()
+    return {
+        "name": Path(resolved).name,
+        "path": resolved,
+        "relative_path": str(Path(resolved).resolve().relative_to(root)),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+    }
+
+
+def validate_config_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Config payload must be a JSON object")
+    if "Config" not in payload or not isinstance(payload["Config"], dict):
+        raise ValueError("Config payload must contain a Config object")
+    return payload
+
+
+def config_payload_from_args(args):
+    return validate_config_payload(json.loads(args.payload))
+
+
+def list_configs(args):
+    root = Path(config_root(args)).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    configs = []
+    for item in sorted(root.glob("*.json")):
+        if item.name.startswith(".") or not item.is_file():
+            continue
+        try:
+            configs.append(config_summary(str(item), args))
+        except ValueError:
+            continue
+    active = active_config_path(args)
+    if not active:
+        default_path = safe_config_path("config.json", args, must_exist=False)
+        active = default_path
+    return {
+        "ok": True,
+        "config_root": str(root),
+        "active_config": active,
+        "configs": configs,
+        "schema": CONFIG_DESCRIPTIONS,
+    }
+
+
+def get_config(args):
+    requested = getattr(args, "path", None) or active_config_path(args) or "config.json"
+    path = safe_config_path(requested, args, must_exist=True)
+    data = config_data(path)
+    return {"ok": True, "config": data, "file": config_summary(path, args), "schema": CONFIG_DESCRIPTIONS}
+
+
+def atomic_write_json(path, payload):
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".booktree-config-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def set_active_config_path(args, path):
+    resolved = safe_config_path(path, args, must_exist=True)
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('active_config_path', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (resolved, now()),
+        )
+        conn.commit()
+    return resolved
+
+
+def save_config(args):
+    path = safe_config_path(args.path, args, must_exist=True)
+    payload = config_payload_from_args(args)
+    atomic_write_json(path, payload)
+    return {"ok": True, "message": "Config saved", "file": config_summary(path, args), "config": payload}
+
+
+def save_config_as(args):
+    path = safe_config_path(args.name, args, must_exist=False)
+    payload = config_payload_from_args(args)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(path) and not getattr(args, "overwrite", False):
+        raise ValueError(f"Config already exists: {Path(path).name}")
+    atomic_write_json(path, payload)
+    active = set_active_config_path(args, path)
+    return {
+        "ok": True,
+        "message": "Config saved as active config",
+        "file": config_summary(path, args),
+        "active_config": active,
+        "config": payload,
+    }
+
+
+def set_active_config(args):
+    active = set_active_config_path(args, args.path)
+    return {"ok": True, "message": "Active config updated", "active_config": active}
 
 
 def log_dir_from_config(path):
@@ -1372,6 +1582,7 @@ def main():
     parser = argparse.ArgumentParser(description="Booktree web UI worker")
     parser.add_argument("--db")
     parser.add_argument("--config")
+    parser.add_argument("--config-dir")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init-db")
@@ -1409,6 +1620,18 @@ def main():
     move_parser.add_argument("--file-ids", required=True)
     process_parser = sub.add_parser("process")
     process_parser.add_argument("--id", type=int, required=True)
+    get_config_parser = sub.add_parser("get-config")
+    get_config_parser.add_argument("--path")
+    save_config_parser = sub.add_parser("save-config")
+    save_config_parser.add_argument("--path", required=True)
+    save_config_parser.add_argument("--payload", required=True)
+    save_as_parser = sub.add_parser("save-config-as")
+    save_as_parser.add_argument("--name", required=True)
+    save_as_parser.add_argument("--payload", required=True)
+    save_as_parser.add_argument("--overwrite", action="store_true")
+    active_config_parser = sub.add_parser("set-active-config")
+    active_config_parser.add_argument("--path", required=True)
+    sub.add_parser("list-configs")
 
     args = parser.parse_args()
     try:
@@ -1440,6 +1663,16 @@ def main():
             output(move_files(args))
         elif args.command == "process":
             output(process_book(args))
+        elif args.command == "list-configs":
+            output(list_configs(args))
+        elif args.command == "get-config":
+            output(get_config(args))
+        elif args.command == "save-config":
+            output(save_config(args))
+        elif args.command == "save-config-as":
+            output(save_config_as(args))
+        elif args.command == "set-active-config":
+            output(set_active_config(args))
     except Exception as exc:
         output({"ok": False, "error": str(exc)})
         raise SystemExit(1)

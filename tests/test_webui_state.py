@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -108,6 +109,24 @@ class WebUiStateTests(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=list(base_row().keys()))
             writer.writeheader()
             writer.writerows(rows)
+
+    def config_args(self, tmp):
+        return Namespace(db=self.db_file(tmp), config="", config_dir=tmp)
+
+    def write_config(self, tmp, name="config.json", **config_overrides):
+        path = os.path.join(tmp, name)
+        payload = {
+            "Config": {
+                "metadata": "mam-audible",
+                "log_path": "/logs",
+                "paths": [],
+                **config_overrides,
+            },
+            "unknown_top": {"keep": True},
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path, payload
 
     def test_sync_processed_book_from_cli_object(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,6 +283,68 @@ class WebUiStateTests(unittest.TestCase):
         self.assertEqual(row["id3-asin"], "ASIN")
         self.assertEqual(row["id3-title"], "Edited Title")
         self.assertEqual(row["id3-authors"], "Author")
+
+    def test_safe_config_path_accepts_config_root_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _payload = self.write_config(tmp, "example.json")
+            args = self.config_args(tmp)
+
+            self.assertEqual(booktree_worker.safe_config_path("example.json", args, must_exist=True), os.path.realpath(path))
+
+    def test_safe_config_path_rejects_traversal_and_non_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.config_args(tmp)
+
+            with self.assertRaises(ValueError):
+                booktree_worker.safe_config_path("../secret.json", args)
+            with self.assertRaises(ValueError):
+                booktree_worker.safe_config_path("config.cfg", args)
+
+    def test_list_configs_returns_json_files_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_config(tmp, "config.json")
+            self.write_config(tmp, "testing.json")
+            with open(os.path.join(tmp, "notes.txt"), "w", encoding="utf-8") as handle:
+                handle.write("ignore")
+
+            result = booktree_worker.list_configs(self.config_args(tmp))
+
+            self.assertEqual([item["name"] for item in result["configs"]], ["config.json", "testing.json"])
+
+    def test_save_config_preserves_unknown_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, payload = self.write_config(tmp)
+            payload["Config"]["metadata"] = "mam"
+            args = Namespace(db=self.db_file(tmp), config="", config_dir=tmp, path=path, payload=json.dumps(payload))
+
+            result = booktree_worker.save_config(args)
+
+            self.assertTrue(result["ok"])
+            with open(path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertEqual(saved["Config"]["metadata"], "mam")
+            self.assertEqual(saved["unknown_top"], {"keep": True})
+
+    def test_save_config_as_creates_file_and_sets_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _path, payload = self.write_config(tmp)
+            args = Namespace(db=self.db_file(tmp), config="", config_dir=tmp, name="testing.json", payload=json.dumps(payload), overwrite=False)
+
+            result = booktree_worker.save_config_as(args)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(os.path.exists(os.path.join(tmp, "testing.json")))
+            self.assertEqual(booktree_worker.active_config_path(self.config_args(tmp)), os.path.realpath(os.path.join(tmp, "testing.json")))
+
+    def test_active_config_path_is_used_without_explicit_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path, _default = self.write_config(tmp, "config.json", metadata="mam")
+            active_path, _active = self.write_config(tmp, "active.json", metadata="audible")
+            args = self.config_args(tmp)
+            booktree_worker.set_active_config_path(args, active_path)
+
+            self.assertEqual(booktree_worker.config_path(args), os.path.realpath(active_path))
+            self.assertNotEqual(booktree_worker.config_path(args), os.path.realpath(default_path))
 
 
 if __name__ == "__main__":
