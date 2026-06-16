@@ -137,6 +137,7 @@ export default function Home() {
   const [saveAsName, setSaveAsName] = useState("");
   const [showSession, setShowSession] = useState(false);
   const [runJob, setRunJob] = useState(null);
+  const [processResult, setProcessResult] = useState(null);
 
   const selectedBook = useMemo(
     () => detail?.book || books.find((book) => book.id === selectedId),
@@ -478,6 +479,46 @@ export default function Home() {
     return { ...result, message: `Search returned ${count} candidate${count === 1 ? "" : "s"}` };
   }
 
+  async function processSelectedBook() {
+    const bookId = detail.book.id;
+    setProcessResult({
+      status: "running",
+      bookId,
+      title: detail.book.title || detail.book.name,
+      logs: "",
+      error: "",
+    });
+    try {
+      const result = await requestJson(`/api/books/${bookId}/process`, { method: "POST" });
+      const nextResult = {
+        status: result.process_status || "complete",
+        jobId: result.job_id,
+        bookId,
+        title: result.book?.title || result.book?.name || detail.book.title || detail.book.name,
+        logs: result.logs || "",
+        error: result.error || "",
+      };
+      setProcessResult(nextResult);
+      setDetail(result);
+      return {
+        ...result,
+        message:
+          nextResult.status === "complete"
+            ? `Processed ${nextResult.title || "book"}`
+            : `Processing failed for ${nextResult.title || "book"}`,
+      };
+    } catch (err) {
+      setProcessResult({
+        status: "failed",
+        bookId,
+        title: detail.book.title || detail.book.name,
+        logs: "",
+        error: err.message,
+      });
+      throw err;
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -668,15 +709,10 @@ export default function Home() {
                   Search Both
                 </button>
                 <button
-                  onClick={() =>
-                    run("process", async () => ({
-                      ...(await requestJson(`/api/books/${detail.book.id}/process`, { method: "POST" })),
-                      message: "Process job completed",
-                    }))
-                  }
+                  onClick={() => run("process", processSelectedBook)}
                   disabled={!!busy}
                 >
-                  Process Book
+                  {busy === "process" ? "Processing..." : detail.book.status === "processed" ? "Processed" : "Process Book"}
                 </button>
                 <button
                   onClick={() =>
@@ -690,6 +726,22 @@ export default function Home() {
                   Mark Ignored
                 </button>
               </div>
+              {processResult ? (
+                <section className="process-panel">
+                  <div className="run-header">
+                    <div>
+                      <strong>{processResult.title || "Book processing"}</strong>
+                      <span className={`badge ${processResult.status}`}>{processResult.status}</span>
+                    </div>
+                    {processResult.jobId ? <div className="small">Job #{processResult.jobId}</div> : null}
+                  </div>
+                  {processResult.status === "running" ? (
+                    <div className="small">Processing this book now. This can take a moment while links and metadata are written.</div>
+                  ) : null}
+                  {processResult.error ? <div className="message error">{processResult.error}</div> : null}
+                  {processResult.logs ? <pre className="run-logs compact-log">{processResult.logs}</pre> : null}
+                </section>
+              ) : null}
               <div className="file-drilldown">
                 <div className="panel-header inline">
                   <h2>Files</h2>

@@ -368,6 +368,14 @@ tr.selected {
   padding: 12px 14px;
 }
 
+.process-panel {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  padding: 12px;
+}
+
 .run-header {
   display: flex;
   align-items: center;
@@ -402,6 +410,10 @@ tr.selected {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.45;
+}
+
+.run-logs.compact-log {
+  max-height: 180px;
 }
 
 .matches {

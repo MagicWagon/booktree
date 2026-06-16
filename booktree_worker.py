@@ -1741,7 +1741,14 @@ def process_book(args):
         add_group_event(conn, args.id, "processed" if status == "complete" else "process_failed", error or "Processed from web UI")
         conn.commit()
         payload = get_book(conn, args.id)
-    return {"ok": status == "complete", "job_id": job_id, "logs": logs.getvalue(), "error": error, **payload}
+    return {
+        "ok": True,
+        "process_status": status,
+        "job_id": job_id,
+        "logs": logs.getvalue(),
+        "error": error,
+        **payload,
+    }
 
 
 def output(payload):
