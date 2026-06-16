@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -345,6 +346,103 @@ class WebUiStateTests(unittest.TestCase):
 
             self.assertEqual(booktree_worker.config_path(args), os.path.realpath(active_path))
             self.assertNotEqual(booktree_worker.config_path(args), os.path.realpath(default_path))
+
+    def test_start_run_uses_active_config_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _default_path, _default = self.write_config(tmp, "config.json", metadata="mam")
+            active_path, _active = self.write_config(tmp, "active.json", metadata="audible")
+            args = self.config_args(tmp)
+            booktree_worker.set_active_config_path(args, active_path)
+
+            with mock.patch("booktree_worker.subprocess.Popen") as popen:
+                result = booktree_worker.start_run(args)
+
+            self.assertTrue(result["ok"])
+            command = popen.call_args.args[0]
+            self.assertIn("--config", command)
+            self.assertEqual(command[command.index("--config") + 1], os.path.realpath(active_path))
+
+    def test_start_run_missing_config_returns_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.config_args(tmp)
+
+            with self.assertRaises(ValueError) as error:
+                booktree_worker.start_run(args)
+
+            self.assertIn("Config file was not found", str(error.exception))
+
+    def test_start_run_missing_active_config_does_not_fall_back_to_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_config(tmp, "config.json")
+            active_path, _active = self.write_config(tmp, "active.json")
+            args = self.config_args(tmp)
+            booktree_worker.set_active_config_path(args, active_path)
+            os.unlink(active_path)
+
+            with self.assertRaises(ValueError) as error:
+                booktree_worker.start_run(args)
+
+            self.assertIn("active.json", str(error.exception))
+
+    def test_start_run_blocks_when_full_run_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active_path, _active = self.write_config(tmp, "config.json")
+            args = self.config_args(tmp)
+            booktree_worker.set_active_config_path(args, active_path)
+            with booktree_worker.connect(self.db_file(tmp)) as conn:
+                booktree_worker.init_db(conn)
+                booktree_worker.create_job(conn, "full_run", status="running", payload={"config_path": active_path})
+                conn.commit()
+
+            with mock.patch("booktree_worker.subprocess.Popen") as popen:
+                result = booktree_worker.start_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("already running", result["error"])
+            popen.assert_not_called()
+
+    def test_run_full_job_stores_completed_logs_and_syncs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active_path, _active = self.write_config(tmp, "config.json")
+            args = self.config_args(tmp)
+            with booktree_worker.connect(self.db_file(tmp)) as conn:
+                booktree_worker.init_db(conn)
+                job_id = booktree_worker.create_job(conn, "full_run", status="queued", payload={"config_path": active_path})
+                conn.commit()
+            run_args = Namespace(db=self.db_file(tmp), config="", config_dir=tmp, job_id=job_id)
+            completed = subprocess.CompletedProcess(["booktree.py", active_path], 0, "done", "")
+
+            with mock.patch("booktree_worker.subprocess.run", return_value=completed), mock.patch(
+                "booktree_worker.import_logs", return_value={"ok": True, "scanned": 1, "imported": 2}
+            ) as import_logs:
+                result = booktree_worker.run_full_job(run_args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["job"]["status"], "complete")
+            self.assertEqual(result["job"]["exit_code"], 0)
+            self.assertIn("done", result["job"]["logs"])
+            self.assertIn("Synced logs: scanned=1 imported=2", result["job"]["logs"])
+            import_logs.assert_called_once()
+
+    def test_run_full_job_stores_failed_exit_and_error_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active_path, _active = self.write_config(tmp, "config.json")
+            with booktree_worker.connect(self.db_file(tmp)) as conn:
+                booktree_worker.init_db(conn)
+                job_id = booktree_worker.create_job(conn, "full_run", status="queued", payload={"config_path": active_path})
+                conn.commit()
+            run_args = Namespace(db=self.db_file(tmp), config="", config_dir=tmp, job_id=job_id)
+            completed = subprocess.CompletedProcess(["booktree.py", active_path], 2, "", "bad cookie")
+
+            with mock.patch("booktree_worker.subprocess.run", return_value=completed), mock.patch(
+                "booktree_worker.import_logs", return_value={"ok": True, "scanned": 0, "imported": 0}
+            ):
+                result = booktree_worker.run_full_job(run_args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["job"]["status"], "failed")
+            self.assertEqual(result["job"]["exit_code"], 2)
+            self.assertIn("bad cookie", result["job"]["error"])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import re
@@ -338,7 +340,15 @@ def init_db(conn):
         );
         """
     )
+    ensure_column(conn, "jobs", "payload_json", "TEXT")
+    ensure_column(conn, "jobs", "exit_code", "INTEGER")
     conn.commit()
+
+
+def ensure_column(conn, table, column, definition):
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def row_to_dict(row):
@@ -827,6 +837,20 @@ def save_config_as(args):
 def set_active_config(args):
     active = set_active_config_path(args, args.path)
     return {"ok": True, "message": "Active config updated", "active_config": active}
+
+
+def full_run_config_path(args):
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'active_config_path'").fetchone()
+    if row:
+        return safe_config_path(row["value"], args, must_exist=True)
+    if getattr(args, "config", None):
+        return safe_config_path(args.config, args, must_exist=True)
+    env_config = os.environ.get("BOOKTREE_CONFIG")
+    if env_config:
+        return safe_config_path(env_config, args, must_exist=True)
+    return safe_config_path("config.json", args, must_exist=True)
 
 
 def log_dir_from_config(path):
@@ -1416,20 +1440,166 @@ def move_files(args):
     return {"ok": True, **payload}
 
 
-def create_job(conn, job_type, book_id):
+def create_job(conn, job_type, book_id=None, status="running", payload=None):
     ts = now()
     conn.execute(
-        "INSERT INTO jobs (type, book_id, status, logs, error, created_at, updated_at) VALUES (?, ?, 'running', '', '', ?, ?)",
-        (job_type, None, ts, ts),
+        """
+        INSERT INTO jobs (type, book_id, status, logs, error, created_at, updated_at, payload_json)
+        VALUES (?, ?, ?, '', '', ?, ?, ?)
+        """,
+        (job_type, book_id, status, ts, ts, json.dumps(payload or {})),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
-def complete_job(conn, job_id, status, logs="", error=""):
+def complete_job(conn, job_id, status, logs="", error="", exit_code=None):
     conn.execute(
-        "UPDATE jobs SET status = ?, logs = ?, error = ?, updated_at = ? WHERE id = ?",
-        (status, logs, error, now(), job_id),
+        "UPDATE jobs SET status = ?, logs = ?, error = ?, exit_code = ?, updated_at = ? WHERE id = ?",
+        (status, logs, error, exit_code, now(), job_id),
     )
+
+
+def job_to_dict(row):
+    payload = row_to_dict(row)
+    if not payload:
+        return None
+    try:
+        payload["payload"] = json.loads(payload.get("payload_json") or "{}")
+    except Exception:
+        payload["payload"] = {}
+    return payload
+
+
+def active_full_run(conn):
+    return conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE type = 'full_run' AND status IN ('queued', 'running')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def get_job(args):
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (args.id,)).fetchone()
+    if not row:
+        raise ValueError(f"Job {args.id} was not found")
+    return {"ok": True, "job": job_to_dict(row)}
+
+
+def latest_job(args):
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE type = ? ORDER BY id DESC LIMIT 1",
+            (args.type,),
+        ).fetchone()
+    return {"ok": True, "job": job_to_dict(row)}
+
+
+def worker_command(args, config_file=None):
+    command = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--db",
+        db_path(args),
+    ]
+    if getattr(args, "config_dir", None):
+        command.extend(["--config-dir", config_root(args)])
+    if config_file:
+        command.extend(["--config", config_file])
+    return command
+
+
+def start_run(args):
+    selected_config = full_run_config_path(args)
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        running = active_full_run(conn)
+        if running:
+            return {
+                "ok": False,
+                "error": f"Booktree run {running['id']} is already {running['status']}",
+                "job": job_to_dict(running),
+            }
+        job_id = create_job(
+            conn,
+            "full_run",
+            status="queued",
+            payload={"config_path": selected_config},
+        )
+        conn.commit()
+
+    command = worker_command(args, selected_config) + ["run-full-job", "--job-id", str(job_id)]
+    try:
+        subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parent,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        with connect(db_path(args)) as conn:
+            init_db(conn)
+            complete_job(conn, job_id, "failed", "", str(exc), exit_code=1)
+            conn.commit()
+        raise
+
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return {"ok": True, "message": "Booktree run started", "job": job_to_dict(row)}
+
+
+def run_full_job(args):
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        row = conn.execute("SELECT * FROM jobs WHERE id = ? AND type = 'full_run'", (args.job_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Full run job {args.job_id} was not found")
+        payload = job_to_dict(row)["payload"]
+        selected_config = safe_config_path(payload.get("config_path") or config_path(args), args, must_exist=True)
+        conn.execute("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ?", (now(), args.job_id))
+        conn.commit()
+
+    command = [sys.executable, os.path.join(Path(__file__).resolve().parent, "booktree.py"), selected_config]
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parent,
+        capture_output=True,
+        text=True,
+    )
+    logs = "\n".join(part for part in [completed.stdout, completed.stderr] if part)
+    status = "complete" if completed.returncode == 0 else "failed"
+    error = "" if completed.returncode == 0 else (completed.stderr.strip() or f"Booktree exited with code {completed.returncode}")
+
+    try:
+        import_args = argparse.Namespace(
+            db=db_path(args),
+            config=selected_config,
+            config_dir=config_root(args),
+            log_file=None,
+            log_dir=None,
+        )
+        sync_result = import_logs(import_args, missing_ok=True)
+        logs = f"{logs}\n\nSynced logs: scanned={sync_result['scanned']} imported={sync_result['imported']}".strip()
+    except Exception as exc:
+        error = error or str(exc)
+        logs = f"{logs}\n\nWarning: failed to sync logs after run: {exc}".strip()
+        if status == "complete":
+            status = "failed"
+
+    with connect(db_path(args)) as conn:
+        init_db(conn)
+        complete_job(conn, args.job_id, status, logs, error, exit_code=completed.returncode)
+        conn.commit()
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (args.job_id,)).fetchone()
+    return {"ok": status == "complete", "job": job_to_dict(row)}
 
 
 def log_row_for_book(book, match):
@@ -1632,6 +1802,13 @@ def main():
     active_config_parser = sub.add_parser("set-active-config")
     active_config_parser.add_argument("--path", required=True)
     sub.add_parser("list-configs")
+    sub.add_parser("start-run")
+    run_job_parser = sub.add_parser("run-full-job")
+    run_job_parser.add_argument("--job-id", type=int, required=True)
+    get_job_parser = sub.add_parser("get-job")
+    get_job_parser.add_argument("--id", type=int, required=True)
+    latest_job_parser = sub.add_parser("latest-job")
+    latest_job_parser.add_argument("--type", default="full_run")
 
     args = parser.parse_args()
     try:
@@ -1673,6 +1850,14 @@ def main():
             output(save_config_as(args))
         elif args.command == "set-active-config":
             output(set_active_config(args))
+        elif args.command == "start-run":
+            output(start_run(args))
+        elif args.command == "run-full-job":
+            output(run_full_job(args))
+        elif args.command == "get-job":
+            output(get_job(args))
+        elif args.command == "latest-job":
+            output(latest_job(args))
     except Exception as exc:
         output({"ok": False, "error": str(exc)})
         raise SystemExit(1)

@@ -256,9 +256,16 @@ tr.selected {
 }
 
 .badge.matched,
-.badge.processed {
+.badge.processed,
+.badge.complete {
   background: #e9f8ef;
   color: var(--success);
+}
+
+.badge.queued,
+.badge.running {
+  background: #eaf2ff;
+  color: var(--accent-strong);
 }
 
 .badge.ignored {
@@ -351,6 +358,50 @@ tr.selected {
   border-color: #f2b8b5;
   background: #fff0ef;
   color: var(--danger);
+}
+
+.run-panel {
+  margin: 12px 16px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px 14px;
+}
+
+.run-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.run-header > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.run-logs {
+  overflow: auto;
+  max-height: 260px;
+  margin: 12px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #111827;
+  color: #f9fafb;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .matches {

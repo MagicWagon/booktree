@@ -136,6 +136,7 @@ export default function Home() {
   const [selectedConfigPath, setSelectedConfigPath] = useState("");
   const [saveAsName, setSaveAsName] = useState("");
   const [showSession, setShowSession] = useState(false);
+  const [runJob, setRunJob] = useState(null);
 
   const selectedBook = useMemo(
     () => detail?.book || books.find((book) => book.id === selectedId),
@@ -188,6 +189,20 @@ export default function Home() {
     setConfigSchema(payload.schema || configSchema);
   }
 
+  async function loadLatestRun() {
+    const payload = await requestJson("/api/runs/booktree/latest");
+    setRunJob(payload.job || null);
+  }
+
+  async function loadRunJob(id = runJob?.id) {
+    if (!id) {
+      return null;
+    }
+    const payload = await requestJson(`/api/jobs/${id}`);
+    setRunJob(payload.job || null);
+    return payload.job || null;
+  }
+
   async function run(label, action) {
     setBusy(label);
     setError("");
@@ -228,6 +243,7 @@ export default function Home() {
 
   useEffect(() => {
     loadConfigList().catch((err) => setError(err.message));
+    loadLatestRun().catch((err) => setError(err.message));
   }, []);
 
   useEffect(() => {
@@ -250,6 +266,23 @@ export default function Home() {
     }, 10000);
     return () => clearInterval(timer);
   }, [busy, status, query, selectedId]);
+
+  useEffect(() => {
+    if (!runJob || !["queued", "running"].includes(runJob.status)) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      loadRunJob(runJob.id)
+        .then((job) => {
+          if (job && !["queued", "running"].includes(job.status)) {
+            return refresh();
+          }
+          return undefined;
+        })
+        .catch((err) => setError(err.message));
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [runJob?.id, runJob?.status]);
 
   function updateField(field, value) {
     setDetail((current) => ({
@@ -342,6 +375,12 @@ export default function Home() {
       method: "POST",
       body: JSON.stringify({ path: configFile?.path || selectedConfigPath }),
     });
+  }
+
+  async function startBooktreeRun() {
+    const result = await requestJson("/api/runs/booktree", { method: "POST" });
+    setRunJob(result.job || null);
+    return { ...result, message: `Booktree run ${result.job?.id || ""} started` };
   }
 
   function fieldHelp(key) {
@@ -448,6 +487,14 @@ export default function Home() {
         </div>
         <div className="toolbar">
           <button
+            className="primary"
+            onClick={() => run("booktree-run", startBooktreeRun)}
+            disabled={!!busy || ["queued", "running"].includes(runJob?.status)}
+            title={activeConfig ? `Run with ${activeConfig}` : "Run with the active config"}
+          >
+            Run Booktree
+          </button>
+          <button
             onClick={() =>
               run("import", async () => ({
                 ...(await requestJson("/api/import", { method: "POST", body: "{}" })),
@@ -483,6 +530,26 @@ export default function Home() {
 
       {message ? <div className="message">{message}</div> : null}
       {error ? <div className="message error">{error}</div> : null}
+      {runJob ? (
+        <section className="run-panel">
+          <div className="run-header">
+            <div>
+              <strong>Booktree Run #{runJob.id}</strong>
+              <span className={`badge ${runJob.status}`}>{runJob.status}</span>
+            </div>
+            <div className="small">
+              {runJob.payload?.config_path || activeConfig || "No active config"}
+            </div>
+          </div>
+          <div className="run-meta small">
+            <span>Started {runJob.created_at || "unknown"}</span>
+            <span>Updated {runJob.updated_at || "unknown"}</span>
+            {runJob.exit_code !== null && runJob.exit_code !== undefined ? <span>Exit {runJob.exit_code}</span> : null}
+          </div>
+          {runJob.error ? <div className="message error">{runJob.error}</div> : null}
+          {runJob.logs ? <pre className="run-logs">{runJob.logs}</pre> : <div className="small">Waiting for run output...</div>}
+        </section>
+      ) : null}
 
       {view === "books" ? (
         <>
