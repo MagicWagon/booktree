@@ -342,6 +342,8 @@ def init_db(conn):
     )
     ensure_column(conn, "jobs", "payload_json", "TEXT")
     ensure_column(conn, "jobs", "exit_code", "INTEGER")
+    ensure_column(conn, "book_groups", "output_path", "TEXT")
+    ensure_column(conn, "book_files", "output_path", "TEXT")
     conn.commit()
 
 
@@ -360,6 +362,47 @@ def clean(value):
         return ""
     value = str(value).strip()
     return "" if value.lower() in {"none", "null"} else value
+
+
+def sanitize_path_token(value):
+    value = clean(value)
+    value = re.sub(r'[<>:"/\\\\|?*]', "", value)
+    value = re.sub(r"\s+", " ", value).strip().rstrip(".")
+    return value
+
+
+def strip_accents_local(value):
+    import unicodedata
+
+    return "".join(c for c in unicodedata.normalize("NFD", clean(value)) if unicodedata.category(c) != "Mn")
+
+
+def cleanse_author_local(author):
+    value = strip_accents_local(author)
+    for token in ["- editor", "- contributor", " - ", "'"]:
+        value = value.replace(token, "")
+    return " ".join(value.replace(".", " ").split())
+
+
+def cleanse_title_local(title):
+    value = clean(title)
+    for token in [" (Unabridged)", "m4b", "mp3", ",", "- "]:
+        value = value.replace(token, " ")
+    value = strip_accents_local(value)
+    value = re.sub(r"\bBook(\s)?(\d)+\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"(:(\s)?([a-zA-Z0-9_'\.\s]{2,})*)", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def cleanse_series_local(series):
+    value = clean(series)
+    for token in [":", "'"]:
+        value = value.replace(token, "")
+    return value.strip()
+
+
+def is_multi_cd_local(parent):
+    return bool(re.search(r"(cd|disc)\s?\d+$", clean(parent), re.IGNORECASE))
 
 
 def first(*values):
@@ -531,6 +574,7 @@ def file_payload_from_log(row, group_id, legacy_book_id=None):
         "audible_count": payload["audible_count"],
         "is_matched": payload["is_matched"],
         "is_hardlinked": payload["is_hardlinked"],
+        "output_path": clean(row.get("paths")) if payload["is_hardlinked"] else "",
         "raw_log_json": payload["raw_log_json"],
         "updated_at": payload["updated_at"],
     }
@@ -643,6 +687,7 @@ def recompute_group(conn, group_id):
             "series": first(*(row["series"] for row in rows)),
             "language": first(*(row["language"] for row in rows), "english"),
         }
+    output_path = first(*(row["output_path"] for row in rows if row["is_hardlinked"]), group["output_path"])
     conn.execute(
         f"""
         UPDATE book_groups
@@ -655,6 +700,7 @@ def recompute_group(conn, group_id):
             file_count = ?,
             detection_reason = ?,
             detection_confidence = ?,
+            output_path = ?,
             updated_at = ?
             {''.join(f', {field} = ?' for field in metadata.keys())}
         WHERE id = ?
@@ -669,6 +715,7 @@ def recompute_group(conn, group_id):
             len(rows),
             reason,
             confidence,
+            output_path,
             now(),
             *metadata.values(),
             group_id,
@@ -1053,7 +1100,7 @@ def list_books(args):
     return {"ok": True, "books": [row_to_dict(row) for row in rows]}
 
 
-def get_book(conn, book_id):
+def get_book(conn, book_id, args=None):
     book = conn.execute("SELECT * FROM book_groups WHERE id = ?", (book_id,)).fetchone()
     if not book:
         raise ValueError(f"Book group {book_id} was not found")
@@ -1067,18 +1114,32 @@ def get_book(conn, book_id):
     files = conn.execute(
         "SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (book_id,)
     ).fetchall()
+    accepted_match = next((row for row in matches if row["is_accepted"]), None)
+    preview = {
+        "current_output_path": clean(book["output_path"]),
+        "pending_output_path": "",
+        "cleanup_targets": [],
+        "can_reprocess": False,
+    }
+    if accepted_match and args is not None:
+        try:
+            cfg = DictConfig(config_data(config_path(args)))
+            preview = destination_preview(row_to_dict(book), [row_to_dict(row) for row in files], row_to_dict(accepted_match), cfg)
+        except Exception:
+            pass
     return {
         "book": row_to_dict(book),
         "files": [row_to_dict(row) for row in files],
         "matches": [row_to_dict(row) for row in matches],
         "search_attempts": [row_to_dict(row) for row in attempts],
+        "reprocess": preview,
     }
 
 
 def get_book_command(args):
     with connect(db_path(args)) as conn:
         init_db(conn)
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, **payload}
 
 
@@ -1106,7 +1167,7 @@ def update_book(args):
         )
         add_group_event(conn, args.id, "updated", "Metadata updated from web UI", {field: payload[field] for field in fields})
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, **payload}
 
 
@@ -1119,6 +1180,108 @@ def query_from_book(book):
         "narrators": book["narrators"] or "",
         "keywords": keywords,
         "language": book["language"] or "english",
+    }
+
+
+def book_for_target(group, match):
+    class TargetBook:
+        pass
+
+    class Contributor:
+        def __init__(self, name):
+            self.name = clean(name)
+
+    class Series:
+        def __init__(self, name, part):
+            self.name = clean(name)
+            self.part = clean(part)
+
+    target = TargetBook()
+    target.title = clean(match.get("title") or group.get("title") or group.get("name"))
+    target.subtitle = clean(match.get("subtitle") or group.get("subtitle"))
+    target.asin = clean(match.get("asin") or group.get("asin"))
+    target.language = clean(match.get("language") or group.get("language") or "english")
+    target.authors = [Contributor(name) for name in clean(match.get("authors") or group.get("authors")).split(",") if clean(name)]
+    target.narrators = [Contributor(name) for name in clean(match.get("narrators") or group.get("narrators")).split(",") if clean(name)]
+    series_name = clean(match.get("series") or group.get("series"))
+    series_part = clean(group.get("series_part"))
+    target.series = [Series(series_name, series_part)] if series_name else []
+    return target
+
+
+def compute_group_destination(file_row, group, match, cfg):
+    probe = book_for_target(group, match)
+
+    media_path = clean(file_row["media_path"] or group["media_path"])
+    multi_author = cfg.get("Config/target_path/multi_author")
+    in_series = cfg.get("Config/target_path/in_series")
+    no_series = cfg.get("Config/target_path/no_series")
+    disc_folder = cfg.get("Config/target_path/disc_folder")
+
+    if not probe.authors:
+        author = "Unknown"
+    elif len(probe.authors) > 1 and multi_author is not None:
+        match multi_author:
+            case "{first_author}":
+                author = probe.authors[0].name
+            case "{authors}":
+                author = ", ".join(item.name for item in probe.authors)
+            case _:
+                author = multi_author
+    else:
+        author = probe.authors[0].name
+
+    author = cleanse_author_local(author) if clean(author) else "Unknown"
+    narrator = ", ".join(item.name for item in probe.narrators) if len(probe.narrators) == 1 else ""
+
+    disc = os.path.basename(os.path.dirname(clean(file_row["file"])))
+    if not is_multi_cd_local(disc):
+        disc = ""
+
+    series = cleanse_series_local(probe.series[0].name) if probe.series else ""
+    part = clean(probe.series[0].part) if probe.series else ""
+    title = cleanse_title_local(probe.title)
+
+    tokens = {
+        "author": sanitize_path_token(author),
+        "series": sanitize_path_token(series),
+        "part": sanitize_path_token(part),
+        "title": sanitize_path_token(probe.title),
+        "cleanTitle": sanitize_path_token(title),
+        "disc": sanitize_path_token(disc),
+        "narrator": f"{{{sanitize_path_token(narrator)}}}" if narrator else "",
+        "narrators": f"{{{sanitize_path_token(narrator)}}}" if narrator else "",
+    }
+
+    path_value = ""
+    template = in_series if probe.series else no_series
+    for segment in template.format(**tokens).split("/"):
+        path_value = os.path.join(path_value, segment.strip())
+    if disc:
+        path_value = os.path.join(path_value, disc_folder.format(**tokens).strip())
+    return clean(os.path.join(media_path, path_value))
+
+
+def output_cleanup_targets(group, files):
+    output_path = clean(group.get("output_path"))
+    if not output_path:
+        return []
+    targets = []
+    for file_row in files:
+        name = os.path.basename(clean(file_row["file"]))
+        if name:
+            targets.append(os.path.join(output_path, name))
+    targets.append(os.path.join(output_path, "metadata.opf"))
+    return targets
+
+
+def destination_preview(group, files, match, cfg):
+    preview = compute_group_destination(files[0], group, match, cfg) if files else ""
+    return {
+        "current_output_path": clean(group.get("output_path")),
+        "pending_output_path": preview,
+        "cleanup_targets": output_cleanup_targets(group, files),
+        "can_reprocess": bool(clean(group.get("output_path")) and match),
     }
 
 
@@ -1280,7 +1443,7 @@ def search_book(args):
             ),
         )
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, "results": results, **payload}
 
 
@@ -1317,7 +1480,7 @@ def accept_match(args):
         )
         add_group_event(conn, args.id, "match_accepted", f"Accepted {match['provider']} match", {"match_id": args.match_id})
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, **payload}
 
 
@@ -1329,7 +1492,7 @@ def mark_ignored(args):
         )
         add_group_event(conn, args.id, "ignored", "Marked ignored from web UI")
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, **payload}
 
 
@@ -1389,7 +1552,7 @@ def split_files(args):
         add_group_event(conn, args.id, "split", "Split selected files into a new group", {"new_group_id": new_group_id, "file_ids": file_ids})
         add_group_event(conn, new_group_id, "created_by_split", "Created from split", {"source_group_id": args.id, "file_ids": file_ids})
         conn.commit()
-        payload = get_book(conn, new_group_id)
+        payload = get_book(conn, new_group_id, args)
     return {"ok": True, "new_group_id": new_group_id, **payload}
 
 
@@ -1414,7 +1577,7 @@ def combine_groups(args):
         recompute_group(conn, args.id)
         add_group_event(conn, args.id, "combined", "Combined groups", {"source_group_ids": source_ids})
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {"ok": True, **payload}
 
 
@@ -1436,7 +1599,7 @@ def move_files(args):
         add_group_event(conn, args.id, "files_moved_out", "Moved files to another group", {"target_group_id": args.target_id, "file_ids": file_ids})
         add_group_event(conn, args.target_id, "files_moved_in", "Moved files from another group", {"source_group_id": args.id, "file_ids": file_ids})
         conn.commit()
-        payload = get_book(conn, args.target_id)
+        payload = get_book(conn, args.target_id, args)
     return {"ok": True, **payload}
 
 
@@ -1638,13 +1801,13 @@ def log_row_for_book(book, match):
     return raw
 
 
-def log_row_for_group_file(group, file_row, match):
+def log_row_for_group_file(group, file_row, match, target_path=None):
     raw = json.loads(file_row["raw_log_json"] or "{}")
     raw.update(
         {
             "book": group["name"],
             "file": file_row["file"],
-            "paths": file_row["paths"] or group["paths"],
+            "paths": target_path if target_path is not None else (file_row["paths"] or group["paths"]),
             "isMatched": "True",
             "isHardLinked": "False",
             "metadatasource": match["provider"],
@@ -1674,38 +1837,58 @@ def log_row_for_group_file(group, file_row, match):
     return raw
 
 
-def process_book(args):
+def get_group_for_processing(conn, group_id):
+    book = row_to_dict(conn.execute("SELECT * FROM book_groups WHERE id = ?", (group_id,)).fetchone())
+    if not book:
+        raise ValueError(f"Book group {group_id} was not found")
+    files = [
+        row_to_dict(row)
+        for row in conn.execute("SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (group_id,)).fetchall()
+    ]
+    if not files:
+        raise ValueError("Book group has no files to process")
+    match = row_to_dict(
+        conn.execute(
+            "SELECT * FROM group_matches WHERE group_id = ? AND is_accepted = 1 ORDER BY id DESC LIMIT 1",
+            (group_id,),
+        ).fetchone()
+    )
+    if not match:
+        raise ValueError("Accept a match before processing this book")
+    return book, files, match
+
+
+def remove_old_output(group, files):
+    removed = []
+    for target in output_cleanup_targets(group, files):
+        if os.path.exists(target):
+            os.remove(target)
+            removed.append(target)
+    return removed
+
+
+def process_group(args, cleanup_old=False):
     with connect(db_path(args)) as conn:
         init_db(conn)
-        book = row_to_dict(conn.execute("SELECT * FROM book_groups WHERE id = ?", (args.id,)).fetchone())
-        if not book:
-            raise ValueError(f"Book group {args.id} was not found")
-        files = [
-            row_to_dict(row)
-            for row in conn.execute("SELECT * FROM book_files WHERE group_id = ? ORDER BY file", (args.id,)).fetchall()
-        ]
-        if not files:
-            raise ValueError("Book group has no files to process")
-        match = row_to_dict(
-            conn.execute(
-                "SELECT * FROM group_matches WHERE group_id = ? AND is_accepted = 1 ORDER BY id DESC LIMIT 1",
-                (args.id,),
-            ).fetchone()
-        )
-        if not match:
-            raise ValueError("Accept a match before processing this book")
-        job_id = create_job(conn, "process_book", args.id)
+        book, files, match = get_group_for_processing(conn, args.id)
+        cfg = DictConfig(config_data(config_path(args)))
+        preview = destination_preview(book, files, match, cfg)
+        pending_path = clean(preview["pending_output_path"])
+        job_id = create_job(conn, "reprocess_book" if cleanup_old else "process_book", args.id)
         conn.commit()
 
     logs = io.StringIO()
     error = ""
     status = "complete"
+    removed_targets = []
     try:
         import booktree
 
         cfg_data = config_data(config_path(args))
         cfg_data.setdefault("Config", {})["metadata"] = "log"
-        process_rows = [log_row_for_group_file(book, file_row, match) for file_row in files]
+        if cleanup_old:
+            removed_targets = remove_old_output(book, files)
+        process_rows = [log_row_for_group_file(book, file_row, match, target_path=pending_path) for file_row in files]
         headers = list(process_rows[0].keys())
         try:
             import myx_utilities
@@ -1729,26 +1912,43 @@ def process_book(args):
 
     with connect(db_path(args)) as conn:
         init_db(conn)
-        complete_job(conn, job_id, status, logs.getvalue(), error)
+        log_text = logs.getvalue()
+        if removed_targets:
+            log_text = f"Removed old output:\n" + "\n".join(removed_targets) + (f"\n\n{log_text}" if log_text else "")
+        complete_job(conn, job_id, status, log_text, error)
         conn.execute(
-            "UPDATE book_groups SET status = ?, is_hardlinked = ?, failure_reason = ?, updated_at = ? WHERE id = ?",
-            ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, error, now(), args.id),
+            "UPDATE book_groups SET status = ?, is_hardlinked = ?, failure_reason = ?, output_path = ?, updated_at = ? WHERE id = ?",
+            ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, error, pending_path if status == "complete" else clean(book.get("output_path")), now(), args.id),
         )
         conn.execute(
-            "UPDATE book_files SET status = ?, is_hardlinked = ?, updated_at = ? WHERE group_id = ?",
-            ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, now(), args.id),
+            "UPDATE book_files SET status = ?, is_hardlinked = ?, output_path = ?, updated_at = ? WHERE group_id = ?",
+            ("processed" if status == "complete" else "failed", 1 if status == "complete" else 0, pending_path if status == "complete" else "", now(), args.id),
         )
-        add_group_event(conn, args.id, "processed" if status == "complete" else "process_failed", error or "Processed from web UI")
+        add_group_event(
+            conn,
+            args.id,
+            "reprocessed" if cleanup_old and status == "complete" else ("processed" if status == "complete" else "process_failed"),
+            error or ("Reprocessed from web UI" if cleanup_old else "Processed from web UI"),
+            {"old_output_path": preview["current_output_path"], "new_output_path": pending_path, "removed_targets": removed_targets},
+        )
         conn.commit()
-        payload = get_book(conn, args.id)
+        payload = get_book(conn, args.id, args)
     return {
         "ok": True,
         "process_status": status,
         "job_id": job_id,
-        "logs": logs.getvalue(),
+        "logs": log_text,
         "error": error,
         **payload,
     }
+
+
+def process_book(args):
+    return process_group(args, cleanup_old=False)
+
+
+def reprocess_book(args):
+    return process_group(args, cleanup_old=True)
 
 
 def output(payload):
@@ -1797,6 +1997,8 @@ def main():
     move_parser.add_argument("--file-ids", required=True)
     process_parser = sub.add_parser("process")
     process_parser.add_argument("--id", type=int, required=True)
+    reprocess_parser = sub.add_parser("reprocess")
+    reprocess_parser.add_argument("--id", type=int, required=True)
     get_config_parser = sub.add_parser("get-config")
     get_config_parser.add_argument("--path")
     save_config_parser = sub.add_parser("save-config")
@@ -1847,6 +2049,8 @@ def main():
             output(move_files(args))
         elif args.command == "process":
             output(process_book(args))
+        elif args.command == "reprocess":
+            output(reprocess_book(args))
         elif args.command == "list-configs":
             output(list_configs(args))
         elif args.command == "get-config":

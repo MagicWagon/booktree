@@ -3,7 +3,9 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
@@ -120,6 +122,14 @@ class WebUiStateTests(unittest.TestCase):
             "Config": {
                 "metadata": "mam-audible",
                 "log_path": "/logs",
+                "flags": {"hardlink": 1, "no_opf": 0, "dry_run": 0},
+                "target_path": {
+                    "multi_author": "{first_author}",
+                    "in_series": "{author}/{series}/{series} #{part} - {title}",
+                    "no_series": "{author}/{title}",
+                    "disc_folder": "{title} {disc}",
+                    "calibre_ingest_path": "",
+                },
                 "paths": [],
                 **config_overrides,
             },
@@ -443,6 +453,99 @@ class WebUiStateTests(unittest.TestCase):
             self.assertEqual(result["job"]["status"], "failed")
             self.assertEqual(result["job"]["exit_code"], 2)
             self.assertIn("bad cookie", result["job"]["error"])
+
+    def test_sync_processed_row_persists_output_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            output_path = "/data/media/Sample Author/Correct Folder"
+            booktree_worker.sync_books(
+                [FakeBook(base_row(isMatched="True", isHardLinked="True", paths=output_path))],
+                FakeConfig(),
+                db_file=db,
+            )
+
+            group = self.group_rows(db)[0]
+            file_row = self.file_rows(db)[0]
+            self.assertEqual(group["output_path"], output_path)
+            self.assertEqual(file_row["output_path"], output_path)
+
+    def test_destination_preview_recomputes_new_path_from_current_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            config_path, _payload = self.write_config(tmp, "config.json")
+            booktree_worker.sync_books(
+                [FakeBook(base_row(isMatched="True", isHardLinked="True", paths="/data/media/Wrong/Folder", **{"id3-title": "Wrong Title", "id3-authors": "Sample Author"}))],
+                FakeConfig(),
+                db_file=db,
+            )
+            with booktree_worker.connect(db) as conn:
+                booktree_worker.init_db(conn)
+                conn.execute(
+                    """
+                    INSERT INTO group_matches
+                    (group_id, provider, external_id, asin, title, subtitle, authors, narrators, series, language, duration, match_rate, is_accepted, raw_json, created_at)
+                    VALUES (1, 'audible', 'asin1', 'asin1', 'Right Title', '', 'Correct Author', '', 'Series Name', 'english', '', 100, 1, '{}', 'now')
+                    """
+                )
+                conn.commit()
+                args = Namespace(db=db, config=config_path, config_dir=tmp, id=1)
+                payload = booktree_worker.get_book(conn, 1, args)
+
+            self.assertEqual(payload["reprocess"]["current_output_path"], "/data/media/Wrong/Folder")
+            self.assertIn("/data/media/Correct Author/Series Name/Series Name # - Right Title", payload["reprocess"]["pending_output_path"])
+
+    def test_reprocess_removes_old_output_and_updates_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.db_file(tmp)
+            config_path, _payload = self.write_config(tmp, "config.json")
+            old_output = os.path.join(tmp, "old-output")
+            os.makedirs(old_output, exist_ok=True)
+            source_file = os.path.join(tmp, "book.m4b")
+            with open(source_file, "w", encoding="utf-8") as handle:
+                handle.write("audio")
+            old_file = os.path.join(old_output, "book.m4b")
+            old_opf = os.path.join(old_output, "metadata.opf")
+            with open(old_file, "w", encoding="utf-8") as handle:
+                handle.write("linked")
+            with open(old_opf, "w", encoding="utf-8") as handle:
+                handle.write("opf")
+
+            booktree_worker.sync_books(
+                [FakeBook(base_row(file=source_file, isMatched="True", isHardLinked="True", paths=old_output, **{"id3-title": "Old Title", "id3-authors": "Old Author"}))],
+                FakeConfig(),
+                db_file=db,
+            )
+            new_output = os.path.join(tmp, "new-output")
+
+            def fake_build_tree(_input_csv, _output_csv, _cfg):
+                os.makedirs(new_output, exist_ok=True)
+                with open(os.path.join(new_output, "book.m4b"), "w", encoding="utf-8") as handle:
+                    handle.write("new")
+
+            fake_booktree = types.SimpleNamespace(buildTreeFromLog=fake_build_tree)
+
+            with booktree_worker.connect(db) as conn:
+                booktree_worker.init_db(conn)
+                conn.execute(
+                    """
+                    INSERT INTO group_matches
+                    (group_id, provider, external_id, asin, title, subtitle, authors, narrators, series, language, duration, match_rate, is_accepted, raw_json, created_at)
+                    VALUES (1, 'audible', 'asin1', 'asin1', 'Right Title', '', 'Correct Author', '', '', 'english', '', 100, 1, '{}', 'now')
+                    """
+                )
+                conn.commit()
+
+            args = Namespace(db=db, config=config_path, config_dir=tmp, id=1)
+            with mock.patch("booktree_worker.compute_group_destination", return_value=new_output), mock.patch.dict(
+                sys.modules, {"booktree": fake_booktree}
+            ):
+                result = booktree_worker.reprocess_book(args)
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(os.path.exists(old_file))
+            self.assertFalse(os.path.exists(old_opf))
+            self.assertEqual(result["book"]["output_path"], new_output)
+            self.assertIn("Removed old output", result["logs"])
 
 
 if __name__ == "__main__":

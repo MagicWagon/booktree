@@ -519,6 +519,47 @@ export default function Home() {
     }
   }
 
+  async function reprocessSelectedBook() {
+    const bookId = detail.book.id;
+    const title = detail.book.title || detail.book.name;
+    setProcessResult({
+      status: "running",
+      bookId,
+      title,
+      logs: "",
+      error: "",
+    });
+    try {
+      const result = await requestJson(`/api/books/${bookId}/reprocess`, { method: "POST" });
+      const nextResult = {
+        status: result.process_status || "complete",
+        jobId: result.job_id,
+        bookId,
+        title: result.book?.title || result.book?.name || title,
+        logs: result.logs || "",
+        error: result.error || "",
+      };
+      setProcessResult(nextResult);
+      setDetail(result);
+      return {
+        ...result,
+        message:
+          nextResult.status === "complete"
+            ? `Reprocessed ${nextResult.title || "book"}`
+            : `Reprocess failed for ${nextResult.title || "book"}`,
+      };
+    } catch (err) {
+      setProcessResult({
+        status: "failed",
+        bookId,
+        title,
+        logs: "",
+        error: err.message,
+      });
+      throw err;
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -633,7 +674,7 @@ export default function Home() {
                   <th>Counts</th>
                   <th>Files</th>
                   <th>Status</th>
-                  <th>Last searched</th>
+                  <th>Destination</th>
                 </tr>
               </thead>
               <tbody>
@@ -660,7 +701,7 @@ export default function Home() {
                       <span className={`badge ${book.status}`}>{statusLabels[book.status] || book.status}</span>
                       {book.failure_reason ? <div className="small">{book.failure_reason}</div> : null}
                     </td>
-                    <td className="small">{book.last_searched_at || "Never"}</td>
+                    <td className="small">{book.status === "processed" ? book.output_path || "Unknown destination" : book.last_searched_at || "Never"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -740,6 +781,40 @@ export default function Home() {
                   ) : null}
                   {processResult.error ? <div className="message error">{processResult.error}</div> : null}
                   {processResult.logs ? <pre className="run-logs compact-log">{processResult.logs}</pre> : null}
+                </section>
+              ) : null}
+              {detail.book.status === "processed" || detail.reprocess?.current_output_path ? (
+                <section className="process-panel">
+                  <div className="panel-header inline">
+                    <h2>Processed Output</h2>
+                    <span className="small">{detail.reprocess?.can_reprocess ? "Correction ready" : "Accept a match to reprocess"}</span>
+                  </div>
+                  <div className="form-grid">
+                    <div className="field full">
+                      <label>Current destination</label>
+                      <input value={detail.reprocess?.current_output_path || detail.book.output_path || ""} readOnly />
+                    </div>
+                    <div className="field full">
+                      <label>Reprocessed destination</label>
+                      <input value={detail.reprocess?.pending_output_path || ""} readOnly />
+                    </div>
+                  </div>
+                  {detail.reprocess?.cleanup_targets?.length ? (
+                    <div className="small">
+                      Reprocess will remove the current output files and `metadata.opf` from the recorded destination before writing the corrected output.
+                    </div>
+                  ) : null}
+                  {detail.reprocess?.cleanup_targets?.length ? (
+                    <pre className="run-logs compact-log">{detail.reprocess.cleanup_targets.join("\n")}</pre>
+                  ) : null}
+                  <div className="actions">
+                    <button
+                      onClick={() => run("reprocess", reprocessSelectedBook)}
+                      disabled={!!busy || !detail.reprocess?.can_reprocess}
+                    >
+                      {busy === "reprocess" ? "Reprocessing..." : "Reprocess Book"}
+                    </button>
+                  </div>
                 </section>
               ) : null}
               <div className="file-drilldown">
