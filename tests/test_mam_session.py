@@ -47,11 +47,17 @@ class MamSessionTests(unittest.TestCase):
 
         self.assertEqual(myx_mam.getMAMSession(cfg), "static-token")
 
-    def test_mousehole_session_is_read_and_decoded(self):
-        state_file = self.write_state({"currentCookie": "token%2Bwith%2Fencoding"})
+    def test_mousehole_v2_cookie_is_read_and_decoded(self):
+        state_file = self.write_state({"version": 2, "cookie": "token%2Bwith%2Fencoding"})
         cfg = self.cfg(mousehole_enabled=1, mousehole_state_file=state_file)
 
         self.assertEqual(myx_mam.getMAMSession(cfg), "token+with/encoding")
+
+    def test_legacy_mousehole_current_cookie_is_still_supported(self):
+        state_file = self.write_state({"currentCookie": "legacy%2Btoken"})
+        cfg = self.cfg(mousehole_enabled=1, mousehole_state_file=state_file)
+
+        self.assertEqual(myx_mam.getMAMSession(cfg), "legacy+token")
 
     def test_missing_mousehole_state_falls_back_to_static_session(self):
         cfg = self.cfg(

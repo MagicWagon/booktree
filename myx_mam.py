@@ -25,7 +25,7 @@ def getMAMSession(cfg):
                 raise Exception("mousehole_state_file is not configured")
             with open(mousehole_state_file) as state_file:
                 state = json.loads(state_file.read())
-            mousehole_session = unquote(state["currentCookie"]).strip()
+            mousehole_session = unquote(state.get("cookie", state.get("currentCookie", ""))).strip()
             if len(mousehole_session):
                 return mousehole_session
             print("Mousehole state file did not contain a session cookie. Checking session ID from config...")
